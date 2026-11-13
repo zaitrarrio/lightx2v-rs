@@ -123,9 +123,37 @@ cargo build -p lightx2v-cli --no-default-features --offline  # CPU-only
   `cargo test -p lightx2v-wgpu` (expect the DiT rollout < 1e-5 and
   the decode < 1e-3 with f32 weights; the f16 decode error is
   printed and bounded at 5e-2).
-- Known stubs for Phase 3: real DiT weights (`generate` needs
-  `--model-dir` and still errors — UMT5 text encoding is the
-  blocker), CUDA backend, NVFP4 micro-block quant, relativistic RoPE
+- Known stubs for Phase 3: the UMT5 text encoder (`generate` /
+  `serve` need precomputed `--embeds` / `--gallery` until it lands),
+  CUDA backend, NVFP4 micro-block quant, relativistic RoPE
   for open-ended streams, H3 backbone variant.
 - Do not push: report the ghapi push-local command to the parent.
   `research/` is excluded from the push set.
+
+## Prompt Studio (Phase 2)
+
+- `lightx2v serve` mirrors fastwan's serve structure (engine thread +
+  job queue + shared job table, same guards and frame format), reimplemented
+  for the lightx2v pipeline — see `docs/design.md` §10 for the API contract.
+  Synthetic mode always runs the toy shape (64×64, 9 frames, 1 chunk);
+  real mode is 832×480, 81/1005 frames, and needs `--gallery` until UMT5
+  lands. Synthetic embeddings are prompt-hash seeded randoms, identical in
+  `serve` and in the page's `tinyEmbeds`.
+- `lightx2v quantize` exports block-ordered f4/f16 weight files for the
+  browser (mirrors `fastwan quantize`; see `docs/design.md` §10 for the
+  R2 upload commands). `lightx2v generate --model-dir <dir> --embeds
+  <file>` runs real generation from precomputed prompt embeddings.
+- `lightx2v-web` is wasm-only (`#![cfg(target_arch = "wasm32")]`, empty
+  rlib on native) on the WebGPU backend: `createEngine("lightx2v" |
+  "tiny")`, `addBlock` / `finishDit` / `loadTae` / `generate` with
+  `prepared`/`step`/`chunk`/`frames` events, `DitBuilder` for
+  one-block-at-a-time loading, `WgpuBackend::download_async` as the
+  only readback. The wgpu crate carries the `webgpu` feature on
+  wasm32. Do not claim browser execution until a real browser/phone
+  runs it — headless WebGPU cannot run on this VM.
+- `web/dist/` (Pages) holds only the page + wasm pkg + prompts +
+  `manifest.json` — never weights. `scripts/deploy-pages.sh
+  [--weights <base URL>]` builds dist/ and prints the deploy command;
+  it does not deploy. Browser prompts are gallery-only (no UMT5 in
+  the browser); the page refuses weight files that are not
+  block-ordered.

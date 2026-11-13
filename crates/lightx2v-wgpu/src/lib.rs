@@ -34,6 +34,12 @@
 //! CPU oracle and executes it with two kernels: `ema_fold` (in place, one
 //! frame into an EMA slot) and `kv_compact` (gather rows by an index map,
 //! zero-filling freshly seeded EMA frames).
+//!
+//! `GBuf` wraps its `wgpu::Buffer` in an `Arc` for cheap cloning. On
+//! wasm32 the web backend's `Buffer` is neither `Send` nor `Sync`, so
+//! clippy's `arc_with_non_send_sync` fires there — allowed: the browser
+//! engine is single-threaded wasm and a `GBuf` never crosses threads.
+#![allow(clippy::arc_with_non_send_sync)]
 
 use lightx2v_core::{
     backend::{Act, Backend, ConvEpilogue, ConvShape, NormKind},
@@ -258,6 +264,67 @@ impl WgpuBackend {
     /// The largest storage-buffer binding this device accepts.
     pub fn max_binding(&self) -> u64 {
         self.device.limits().max_storage_buffer_binding_size
+    }
+
+    /// One line per adapter property the studio page shows next to the
+    /// engine status (adapter name, backend, binding and workgroup limits).
+    pub fn limits_text(&self) -> String {
+        let l = self.device.limits();
+        format!(
+            "{} ({:?}, backend {:?}) · max binding {} MiB · max workgroup storage {} KiB · max buffer {} GiB",
+            self.info.name,
+            self.info.device_type,
+            self.info.backend,
+            l.max_storage_buffer_binding_size / (1 << 20),
+            l.max_compute_workgroup_storage_size / 1024,
+            l.max_buffer_size / (1 << 30),
+        )
+    }
+
+    /// Read a buffer back without blocking the JS event loop: the staging
+    /// copy's `map_async` resolves a JS promise, and on WebGPU the device
+    /// is polled automatically (wgpu's `Device::poll` is a no-op there).
+    /// The synchronous `download` in the `Backend` impl would hang the
+    /// browser — the web engine must use this one.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn download_async(&self, b: &GBuf) -> Result<Vec<f32>, String> {
+        if b.len == 0 {
+            return Ok(Vec::new());
+        }
+        self.flush();
+        let bytes = b.len * 4;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&b.buf, 0, &staging, 0, bytes as u64);
+            self.queue.submit([enc.finish()]);
+        }
+        let slice = staging.slice(..bytes as u64);
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            let resolve = resolve.clone();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = resolve.call0(&wasm_bindgen::JsValue::from_bool(r.is_ok()));
+            });
+        });
+        let ok = wasm_bindgen_futures::JsFuture::from(promise).await;
+        let mapped = ok
+            .map(|v| v.as_bool().unwrap_or(false))
+            .map_err(|e| format!("map_async promise rejected: {e:?}"))?;
+        if !mapped {
+            return Err("GPU readback failed to map the staging buffer".to_string());
+        }
+        let view = slice
+            .get_mapped_range()
+            .map_err(|e| format!("get_mapped_range: {e}"))?;
+        let out: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
+        drop(view);
+        staging.unmap();
+        Ok(out)
     }
 
     /// The first WebGPU error or device loss seen so far (browser only).

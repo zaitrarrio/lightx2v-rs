@@ -7,3 +7,6 @@ models/
 *.pt
 *.pth
 .DS_Store
+web-weights/
+web/pkg/
+web/dist/

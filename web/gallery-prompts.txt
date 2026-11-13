@@ -1,0 +1,22 @@
+# Prompts for LightX2V Prompt Studio. One prompt per line; the first five are
+# the page's built-in examples. Written for long consistent rollouts: a single
+# subject or place that the camera can stay with for 60 s while the MemRoPE
+# history keeps it coherent, rather than a montage of cuts.
+#
+# With real weights, embed once with:
+#   python3 scripts/encode_prompt.py --model-dir <Wan2.1-T2V-1.3B DMD dir> \
+#       --prompt-file web/gallery-prompts.txt --out-dir gallery/
+# and serve with: lightx2v serve --model-dir <dir> --gallery gallery/
+# In --synthetic mode these are just example prompts; any prompt is accepted.
+A red fox trots through fresh snow in a birch forest at dawn, its breath steaming, low golden sunlight, shallow depth of field.
+A jazz saxophonist plays on a rain-slick street corner at night, neon signs reflected in puddles, steam rising from a food stall nearby, slow push in.
+A crowded night market in the rain, neon signs reflected in puddles, steam rising from food stalls, handheld camera moving through the crowd.
+Aerial drone shot sweeping along green sea cliffs as waves crash into white foam, overcast sky, cinematic.
+Close-up of hot water pouring in a slow spiral over coffee grounds in a glass pour-over, morning window light, macro detail.
+Top-down view of orange and white koi gliding beneath lily pads in a clear pond, ripples spreading, soft daylight.
+A golden retriever puppy tumbles through tall summer grass chasing a butterfly, warm backlight, slow motion.
+A lighthouse keeper walks the cliff path to the tower as dusk falls, waves breaking far below, gulls circling, steady wide shot.
+A steam locomotive crosses a stone viaduct over a misty mountain valley in autumn, smoke trailing, wide shot.
+Time-lapse of clouds rolling over a snow-capped mountain peak at sunset, shadows sweeping across the glacier.
+A paper boat drifts down a rain-filled gutter on a city street, reflections of shop lights shimmering, low angle.
+A chef tosses vegetables in a flaming wok in a busy restaurant kitchen, sparks and steam, warm tungsten light.

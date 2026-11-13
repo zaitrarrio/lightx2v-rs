@@ -1,0 +1,22 @@
+[package]
+name = "lightx2v-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LightX2V in the browser: the CPU backend behind a wasm-bindgen API for Prompt Studio."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lightx2v-core = { version = "0.1.0", path = "../lightx2v-core" }
+lightx2v-model = { version = "0.1.0", path = "../lightx2v-model" }
+lightx2v-wgpu = { version = "0.1.0", path = "../lightx2v-wgpu" }
+
+# wasm-only deps: the crate stays a plain rlib on native targets, so
+# `cargo test --workspace` never pulls the wasm toolchain in.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "=0.4.80"
+js-sys = "=0.3.107"
+console_error_panic_hook = "0.1.7"

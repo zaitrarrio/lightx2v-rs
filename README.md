@@ -58,9 +58,15 @@ crates/lightx2v-wgpu   WebGPU backend: full Backend trait, WGSL shaders,
                        KV cache on-device
 crates/lightx2v-model  DiT over Backend, causal chunk pipeline, 4-step DMD
                        sampler, TAEHV decode, conformance checks
-crates/lightx2v-cli    `lightx2v` binary: plan / check / bench / generate
-                       (--backend cpu|wgpu|auto, default auto)
-scripts/reference/     make_fixture.py — tiny safetensors fixture generator
+crates/lightx2v-web    in-browser engine: the tiny synthetic model on the
+                       CPU backend behind a wasm-bindgen API (wasm32 only)
+crates/lightx2v-cli    `lightx2v` binary: plan / check / bench / generate /
+                       serve (--backend cpu|wgpu|auto, default auto)
+web/studio.html        Prompt Studio single-file UI (no CDN deps)
+web/gallery-prompts.txt  12 prompts written for long consistent rollouts
+scripts/build-web.sh   wasm build into web/pkg/ (scripts/deploy-pages.sh
+scripts/build-site.py  builds web/dist/ for Cloudflare Pages; no weights)
+scripts/encode_prompt.py  STUB: gallery format for precomputed UMT5 embeds
 docs/design.md         what is fused and why, what is verified, what is next
 ```
 
@@ -100,9 +106,92 @@ cargo fmt --check                       # clean
 60 s demo (1005 frames) peaks **17992.6 MiB** with no offload — it does
 not fit 16 GiB; `--offload block` keeps 189,199,572 of 2,837,993,600
 weight bytes resident. `generate` without `--synthetic` needs
-`--model-dir` with a Wan2.1-T2V-1.3B DMD checkpoint and errors cleanly
-otherwise; real-checkpoint generation is Phase 3 (UMT5 text encoding
-is still missing).
+`--model-dir` with a Wan2.1-T2V-1.3B DMD checkpoint plus `--embeds` with
+precomputed UMT5 prompt embeddings (see `scripts/encode_prompt.py`); it
+errors cleanly otherwise. The UMT5 text encoder itself is Phase 3.
+
+## Prompt Studio
+
+`lightx2v serve` is the lightx2v equivalent of fastwan's Prompt Studio —
+a local engine plus a single-file web UI (`web/studio.html`), not a
+hosted API. The engine thread owns the backend and the resident DiT/TAEHV
+and runs jobs one at a time from a queue (max 3 queued); the HTTP thread
+only reads the shared job table, so polling never waits on the engine.
+
+```sh
+./target/debug/lightx2v serve --synthetic
+# -> http://127.0.0.1:7860/  (studio page, health, gallery, jobs)
+./target/debug/lightx2v serve --synthetic --allow-origin https://lightx2v.pages.dev
+./target/debug/lightx2v serve --model-dir <ckpt> --gallery gallery/
+./target/debug/lightx2v quantize --transformer <ckpt>/transformer --weights int4-hqq-g64 --out web-weights/lightx2v-1.3b-f4.safetensors
+./target/debug/lightx2v generate --model-dir <ckpt> --embeds fox.safetensors --frames 81 --out clip
+```
+
+| Mode | Prompts | Output |
+| --- | --- | --- |
+| `--synthetic` | any prompt; embeddings are seeded randoms from the prompt hash | tiny random model: 64×64, 9 frames, 1 chunk (structured noise — it proves the path, not the picture) |
+| `--synthetic --gallery <dir>` | only that gallery's prompts | same toy output, gallery-restricted |
+| `--model-dir <dir> --gallery <dir>` | only that gallery's prompts (precomputed UMT5 embeddings) | real 1.3B DiT, 832×480, 81 or 1005 frames, 7 or 84 MemRoPE chunks |
+| `--model-dir <dir>` (no gallery) | — | engine fails to start and names the missing UMT5 encoder |
+
+API: `GET /` (studio page), `GET /api/health` (ready/backend/model/
+synthetic/gallery/max), `GET /api/gallery`, `POST /api/generate`
+`{prompt, width, height, frames, seed?}` → `{id, seed}` (JSON-only +
+Origin guard, 429 past 3 queued), `GET /api/jobs/<id>` (stage, per-step
+and per-chunk timings, frames decoded so far, `chunks_done` /
+`total_chunks` for the long-video rollout), `GET /api/jobs/<id>/frames?from=N`
+(binary: u32 LE width, height, first, count, then RGB8). Frames decode
+progressively via `TaeHv::decode_chunk`, so they land as they decode.
+An engine panic surfaces into the job error and `/api/health`.
+
+**In this browser:** the page's browser mode loads `web/pkg/` (built by
+`scripts/build-web.sh` from `crates/lightx2v-web`) and runs the real
+Wan2.1-T2V-1.3B DMD student on WebGPU — weights stream from a public R2
+bucket, one transformer block per HTTP Range request, into the browser
+cache (downloaded once), via `createEngine("lightx2v")` +
+`addBlock`/`finishDit`/`loadTae`/`generate` with `prepared`/`step`/`chunk`/
+`frames` events. Two weight files: **f4** = int4-hqq-g64 block linears,
+everything else f16 (~0.88 GB) and **f16** = everything f16 (~2.98 GB),
+plus TAEHV (~23 MB), produced by `lightx2v quantize` (see below) and
+written block-ordered — the page **refuses** files that are not
+block-ordered. With no weights configured the page offers the tiny
+synthetic model (`createEngine("tiny")`, `?model=tiny`) as the dev
+fallback. Browser prompts come from the gallery — there is no text
+encoder in the browser (UMT5-XXL is 11 GB); arbitrary prompts need the
+local server. `scripts/deploy-pages.sh [--weights <base URL>]` builds
+`web/dist/` (studio page + wasm pkg + gallery prompts + `manifest.json`,
+never weights) for Cloudflare Pages; it does not deploy by itself.
+`?weights=<base URL>` points the page at other weights.
+
+**Weights export:** `lightx2v quantize --transformer <dir> --weights
+<int4-hqq-g64 | native> --out <file>` reads a HF
+FastWan2.1-T2V-1.3B-Diffusers transformer dir and writes a block-ordered
+safetensors file under `web-weights/` (git-ignored, never committed).
+`scripts/encode_prompt.py` produces the gallery embeds (needs
+torch + transformers + ~12 GB RAM — a user's-machine step, not this VM).
+
+**Fastwan parity:** the studio mirrors fastwan-rs piece for piece:
+
+| fastwan-rs | lightx2v-rs |
+| --- | --- |
+| `fastwan quantize --transformer … --weights int4-hqq-g64-ffn --out …` | `lightx2v quantize --transformer … --weights int4-hqq-g64[-ffn] --out …` |
+| `fastwan-1.3b-f4.safetensors` (0.88 GB) / `fastwan-1.3b-f16.safetensors` (2.98 GB) / `taew2_1.safetensors` (23 MB) | `lightx2v-1.3b-f4.safetensors` / `lightx2v-1.3b-f16.safetensors` / `taew2_1.safetensors` (same sizes, same sources) |
+| `fastwan serve` (DiT + TAEHV resident, `--synthetic`, `--allow-origin`, JSON-only + Origin guard) | `lightx2v serve` (same shape + MemRoPE chunk progress) |
+| `fastwan-web` (`createEngine`, `addBlock`, `finishDit`, `loadTae`, `generate`, `prepared`/`step`/`frames`) | `lightx2v-web` (same shape + `chunk` events for the causal rollout, `download_async` readback) |
+| `web/demo.html` (`PUBLIC_WEIGHTS`, `?weights=`, Cache API, `readGroups` block-order guard) | `web/studio.html` (same shape, `lightx2v-weights-v1` cache) |
+| `scripts/encode_prompt.py` (UMT5 → `prompt_embeds` gallery) | `scripts/encode_prompt.py` (same, plus `--prompt-file` gallery mode) |
+| `scripts/deploy-pages.sh` → fastwan.pages.dev | `scripts/deploy-pages.sh [--weights …]` → lightx2v.pages.dev |
+| 3-step DMD schedule `[1000, 757, 522]`, shift 8 | **4-step DMD schedule `[1000, 750, 500, 250]`, shift 5.0** — the one deliberate divergence: the schedule is a property of the History-Forcing student, not the weights |
+| x4 upscaler (Real-ESRGAN compact) | later stretch goal, not v1 |
+
+**Synthetic vs real, plainly:** everything end-to-end is verified in
+synthetic mode (serve smoke test: job reaches `done`, 9 frames,
+110,608 frame bytes; wasm builds and `build-web.sh` produces
+`web/pkg/`). Real weights are exported and verified on CPU (see below)
+— but a real generation on this VM and any browser execution are **not
+yet verified**: the gallery embeds need a 12 GB machine, and headless
+WebGPU cannot run here, so the only real gate for browser execution is
+a real browser/phone. See `docs/design.md` §10 for the exact status.
 
 ## Lineage
 

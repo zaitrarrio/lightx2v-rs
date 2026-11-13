@@ -1,0 +1,720 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LightX2V Prompt Studio</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171c25; --line:#2a3140; --text:#e8ecf3; --dim:#9aa5b8;
+          --accent:#7dd3fc; --accent2:#f0abfc; --ok:#4ade80; --bad:#f87171; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  header { padding:18px 22px 10px; border-bottom:1px solid var(--line); }
+  h1 { margin:0; font-size:22px; letter-spacing:.2px; }
+  h1 span { color:var(--accent); }
+  header p { margin:4px 0 0; color:var(--dim); max-width:72ch; }
+  main { display:grid; grid-template-columns:minmax(320px,420px) 1fr; gap:18px;
+         padding:18px 22px 30px; align-items:start; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+           padding:16px; }
+  .panel h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase;
+              letter-spacing:.08em; color:var(--dim); }
+  label { display:block; margin:12px 0 4px; color:var(--dim); font-size:13px; }
+  textarea, select, input[type=text], input[type=number] {
+    width:100%; background:#0e1116; color:var(--text); border:1px solid var(--line);
+    border-radius:8px; padding:9px 10px; font:inherit; }
+  textarea { min-height:84px; resize:vertical; }
+  .row { display:flex; gap:10px; align-items:end; }
+  .row > * { flex:1; }
+  button { background:var(--accent); color:#08202e; border:0; border-radius:8px;
+           padding:10px 16px; font:inherit; font-weight:650; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.ghost { background:transparent; color:var(--text); border:1px solid var(--line); }
+  #go { width:100%; margin-top:14px; font-size:16px; }
+  #eng-dot { display:inline-block; width:10px; height:10px; border-radius:50%;
+             background:#64748b; margin-right:6px; vertical-align:1px; }
+  #eng-dot.ok { background:var(--ok); } #eng-dot.bad { background:var(--bad); }
+  #eng-dot.busy { background:#facc15; }
+  .badge { display:inline-block; font-size:12px; padding:2px 8px; border-radius:20px;
+           border:1px solid var(--line); color:var(--dim); margin-left:8px; vertical-align:2px; }
+  .badge.syn { color:#fde68a; border-color:#854d0e; }
+  .examples { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .examples button { padding:5px 9px; font-size:12.5px; background:#0e1116;
+                     color:var(--text); border:1px solid var(--line); font-weight:400; }
+  #gallery-note { color:var(--dim); font-size:13px; margin-top:6px; }
+  #browser-panel { margin-top:12px; }
+  #browser-panel[hidden] { display:none; }
+  .bar { height:8px; background:#0e1116; border:1px solid var(--line); border-radius:6px;
+         overflow:hidden; margin-top:6px; }
+  .bar > div { height:100%; width:0%; background:var(--accent); transition:width .2s; }
+  #bw-status, #summary { color:var(--dim); font-size:13px; margin-top:8px;
+                         white-space:pre-wrap; word-break:break-word; }
+  #out-h { margin:0 0 10px; font-size:14px; }
+  #screen { background:#000; border:1px solid var(--line); border-radius:12px;
+            width:100%; aspect-ratio:16/9; display:flex; align-items:center;
+            justify-content:center; overflow:hidden; }
+  #canvas { max-width:100%; max-height:100%; image-rendering:auto; }
+  .controls { display:flex; gap:10px; align-items:center; margin-top:12px; flex-wrap:wrap; }
+  .controls input[type=range] { flex:1; min-width:120px; }
+  #counter { color:var(--dim); font-variant-numeric:tabular-nums; min-width:90px; }
+  .longvideo { margin-top:12px; border-top:1px solid var(--line); padding-top:12px; }
+  .longvideo .bar > div { background:var(--accent2); }
+  #chunk-label { color:var(--dim); font-size:13px; margin-top:4px; }
+  .note { color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LightX2V <span>Prompt Studio</span><span id="synthetic" class="badge syn" hidden>synthetic toy model</span></h1>
+  <p>Long video from a prompt: a 4-step DMD student denoises 3 latent frames at a time while
+  the MemRoPE history cache keeps the scene coherent — 81 frames for a short clip, 1005 frames
+  for the 60&nbsp;s rollout. Frames stream in as they decode. In this browser the real
+  Wan2.1-T2V-1.3B weights run on your own GPU (one transformer block per download, cached
+  after the first load); browser prompts come from the gallery — arbitrary prompts need the
+  local server, which encodes them from a gallery embeds file until UMT5 lands.</p>
+</header>
+<main>
+  <section class="panel">
+    <h2>Prompt</h2>
+    <div><span id="eng-dot"></span><span id="eng-text">engine: not connected</span></div>
+
+    <label for="modes">Backend</label>
+    <select id="modes">
+      <option value="server">Local server — this machine's engine</option>
+      <option value="browser">In this browser (WebGPU / wasm)</option>
+    </select>
+
+    <div id="browser-panel" hidden>
+      <label for="bw-variant">Browser weights</label>
+      <select id="bw-variant"></select>
+      <div class="row">
+        <div><button id="bw-load" class="ghost" type="button">Load model</button></div>
+        <div><button id="connect" class="ghost" type="button">Connect to server</button></div>
+      </div>
+      <div class="bar"><div id="bw-bar"></div></div>
+      <div id="bw-status">Browser engine not loaded.</div>
+      <label for="engine-url">Server URL</label>
+      <input id="engine-url" type="text" value="http://127.0.0.1:7860" spellcheck="false">
+    </div>
+
+    <label for="prompt">Prompt</label>
+    <textarea id="prompt" spellcheck="false">A red fox trots through fresh snow in a birch forest at dawn, its breath steaming, low golden sunlight, shallow depth of field.</textarea>
+    <div class="examples" id="examples"></div>
+    <div id="gallery-note"></div>
+
+    <div class="row">
+      <div>
+        <label for="size">Size</label>
+        <select id="size">
+          <option value="832x480">832×480 (real weights)</option>
+          <option value="480x272">480×272 (real weights, lighter)</option>
+          <option value="64x64">64×64 (synthetic toy)</option>
+        </select>
+      </div>
+      <div>
+        <label for="length">Length</label>
+        <select id="length">
+          <option value="81">Short clip — 81 frames (~5 s)</option>
+          <option value="1005">Long video — 1005 frames (60 s)</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="seed">Seed</label>
+        <input id="seed" type="number" value="0" min="0">
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button id="dice" class="ghost" type="button" title="Random seed">🎲 Random seed</button>
+      </div>
+    </div>
+
+    <button id="go" type="button">Generate</button>
+
+    <div class="longvideo">
+      <h2>MemRoPE long-video rollout</h2>
+      <div class="bar"><div id="bar"></div></div>
+      <div id="chunk-label">No rollout running.</div>
+      <div id="summary" class="note"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2 id="out-h">Output</h2>
+    <div id="screen"><canvas id="canvas" width="832" height="480"></canvas></div>
+    <div class="controls">
+      <button id="play" type="button" disabled>▶ Play</button>
+      <input id="scrub" type="range" min="0" max="0" value="0" step="1" disabled>
+      <span id="counter">0 / 0 frames</span>
+      <button id="save-webm" type="button" class="ghost" disabled>Save WebM</button>
+      <button id="save-png" type="button" class="ghost" disabled>Save PNG</button>
+    </div>
+    <p class="note">Frames play as they arrive — the decoder streams them chunk by chunk, so a
+    60&nbsp;s rollout starts showing picture long before the last chunk denoises.
+    In synthetic mode the model is random weights: the output is structured noise,
+    which is the point — it proves the whole path (prompt → denoise → decode → play)
+    without a download.</p>
+  </section>
+</main>
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const els = {
+  dot: $("eng-dot"), text: $("eng-text"), modes: $("modes"), browserPanel: $("browser-panel"),
+  bwVariant: $("bw-variant"), bwLoad: $("bw-load"), bwBar: $("bw-bar"), bwStatus: $("bw-status"),
+  connect: $("connect"), engineUrl: $("engine-url"), prompt: $("prompt"),
+  examples: $("examples"), galleryNote: $("gallery-note"), size: $("size"), length: $("length"),
+  seed: $("seed"), dice: $("dice"), go: $("go"), synthetic: $("synthetic"),
+  bar: $("bar"), chunkLabel: $("chunk-label"), summary: $("summary"),
+  outH: $("out-h"), canvas: $("canvas"), play: $("play"), scrub: $("scrub"),
+  counter: $("counter"), saveWebm: $("save-webm"), savePng: $("save-png"),
+};
+const FPS = 16;
+const CAN_BROWSER = "gpu" in navigator;
+const PARAMS = new URLSearchParams(location.search);
+// Weights base URL: ?weights=<base URL> wins; the Pages build substitutes
+// the placeholder in the next line at deploy time; anything else means no public
+// weights are configured and the page offers the tiny synthetic model.
+let WEIGHTS = PARAMS.get("weights") || "__LIGHTX2V_WEIGHTS__";
+if (WEIGHTS.startsWith("__")) WEIGHTS = "";
+const TINY = PARAMS.get("model") === "tiny";
+const store = (k, v) => {
+  try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); }
+  catch { return null; }
+};
+const mb = (n) => `${(n / (1 << 20)).toFixed(n >= 1 << 30 ? 2 : 0)} MB`;
+const norm = (s) => s.trim().replace(/\s+/g, " ").toLowerCase();
+const escHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+let frames = [];           // Uint8ClampedArray per frame, RGBA
+let fw = 0, fh = 0, shown = 0, playing = false, raf = 0, lastTick = 0;
+let serverBase = els.engineUrl.value.replace(/\/$/, "");
+let serverHealth = null, currentJob = null, pollTimer = 0;
+// Browser engine state (fastwan demo.html shape).
+const bw = { mod: null, eng: null, manifest: null, entries: [], galleryBase: "", loaded: null };
+let job = null;
+
+function setEngine(state, text) {
+  els.dot.className = state;
+  els.text.textContent = text;
+}
+function setProgress(frac, label) {
+  els.bar.style.width = `${Math.round(frac * 100)}%`;
+  els.chunkLabel.textContent = label;
+}
+function setSummary(s) { els.summary.textContent = s; }
+function bwStatus(state, text) {
+  els.bwStatus.textContent = text;
+  if (state === "ok") setEngine("ok", els.text.textContent);
+}
+
+function drawFrame(i) {
+  if (!frames.length) return;
+  const idx = Math.max(0, Math.min(i, frames.length - 1));
+  shown = idx;
+  const ctx = els.canvas.getContext("2d");
+  if (els.canvas.width !== fw || els.canvas.height !== fh) {
+    els.canvas.width = fw; els.canvas.height = fh;
+  }
+  ctx.putImageData(new ImageData(frames[idx], fw, fh), 0, 0);
+  els.scrub.max = frames.length - 1;
+  els.scrub.value = idx;
+  els.counter.textContent = `${idx + 1} / ${frames.length} frames`;
+  els.play.disabled = frames.length < 2;
+  els.scrub.disabled = frames.length < 2;
+  els.saveWebm.disabled = frames.length < 1;
+  els.savePng.disabled = frames.length < 1;
+}
+function addFrames(width, height, rgb) {
+  const px = width * height, n = rgb.length / (px * 3);
+  if (frames.length === 0) { fw = width; fh = height; }
+  for (let f = 0; f < n; f++) {
+    const rgba = new Uint8ClampedArray(px * 4);
+    for (let p = 0; p < px; p++) {
+      rgba[p * 4] = rgb[(f * px + p) * 3];
+      rgba[p * 4 + 1] = rgb[(f * px + p) * 3 + 1];
+      rgba[p * 4 + 2] = rgb[(f * px + p) * 3 + 2];
+      rgba[p * 4 + 3] = 255;
+    }
+    frames.push(rgba);
+  }
+  if (!playing) drawFrame(frames.length - 1);
+  els.scrub.max = frames.length - 1;
+  els.counter.textContent = `${shown + 1} / ${frames.length} frames`;
+}
+function resetOutput() {
+  frames = []; shown = 0; stopPlay();
+  els.canvas.getContext("2d").clearRect(0, 0, els.canvas.width, els.canvas.height);
+  els.counter.textContent = "0 / 0 frames";
+  els.play.disabled = els.scrub.disabled = els.saveWebm.disabled = els.savePng.disabled = true;
+}
+function tick(ts) {
+  if (!playing) return;
+  if (ts - lastTick >= 1000 / FPS) {
+    lastTick = ts;
+    drawFrame((shown + 1) % frames.length);
+  }
+  raf = requestAnimationFrame(tick);
+}
+function startPlay() {
+  if (frames.length < 2) return;
+  playing = true; els.play.textContent = "⏸ Pause"; lastTick = 0;
+  raf = requestAnimationFrame(tick);
+}
+function stopPlay() {
+  playing = false; els.play.textContent = "▶ Play";
+  cancelAnimationFrame(raf);
+}
+els.play.onclick = () => (playing ? stopPlay() : startPlay());
+els.scrub.oninput = () => { stopPlay(); drawFrame(parseInt(els.scrub.value, 10)); };
+els.dice.onclick = () => { els.seed.value = Math.floor(Math.random() * 1e9); };
+els.savePng.onclick = () => {
+  els.canvas.toBlob((b) => {
+    if (!b) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(b);
+    a.download = `lightx2v-frame-${shown + 1}.png`; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }, "image/png");
+};
+els.saveWebm.onclick = () => {
+  const stream = els.canvas.captureStream(FPS);
+  const rec = new MediaRecorder(stream, { mimeType: "video/webm" });
+  const parts = [];
+  rec.ondataavailable = (e) => parts.push(e.data);
+  rec.onstop = () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob(parts, { type: "video/webm" }));
+    a.download = "lightx2v-clip.webm"; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  };
+  rec.start();
+  drawFrame(0); startPlay();
+  setTimeout(() => { rec.stop(); stopPlay(); }, (frames.length / FPS) * 1000);
+};
+
+function fillExamples(prompts, restricted) {
+  els.examples.innerHTML = "";
+  for (const p of prompts.slice(0, 5)) {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = p.length > 42 ? p.slice(0, 42) + "…" : p;
+    b.title = p; b.onclick = () => { els.prompt.value = p; };
+    els.examples.appendChild(b);
+  }
+  els.galleryNote.textContent = restricted
+    ? "This engine has no text encoder: only these gallery prompts can run."
+    : "Examples — any prompt works in synthetic mode; with real weights only gallery prompts run until UMT5 lands.";
+}
+
+// ---- server mode (unchanged) ----------------------------------------------
+
+async function refreshServerHealth() {
+  try {
+    const r = await fetch(`${serverBase}/api/health`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    serverHealth = await r.json();
+    if (serverHealth.ready) {
+      setEngine("ok", `engine: ${serverHealth.backend} · ${serverHealth.model}`);
+    } else if (serverHealth.error) {
+      setEngine("bad", `engine failed: ${serverHealth.error}`);
+    } else {
+      setEngine("busy", `engine loading: ${serverHealth.loading || "starting…"}`);
+    }
+    els.synthetic.hidden = !serverHealth.synthetic;
+    const g = await fetch(`${serverBase}/api/gallery`).then((x) => x.json());
+    fillExamples(g.prompts, g.restricted);
+    return true;
+  } catch (e) {
+    setEngine("bad", `server not reachable at ${serverBase} (${e.message})`);
+    return false;
+  }
+}
+
+async function runOnServer() {
+  const [w, h] = els.size.value.split("x").map(Number);
+  const body = {
+    prompt: els.prompt.value, width: w, height: h,
+    frames: parseInt(els.length.value, 10), seed: parseInt(els.seed.value, 10) || 0,
+  };
+  setEngine("busy", "engine: queueing…");
+  const r = await fetch(`${serverBase}/api/generate`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const v = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(v.error || `HTTP ${r.status}`);
+  currentJob = v.id;
+  resetOutput();
+  setProgress(0, `Job ${v.id} queued — waiting for the engine…`);
+  clearInterval(pollTimer);
+  let fetched = 0;
+  pollTimer = setInterval(async () => {
+    try {
+      const st = await fetch(`${serverBase}/api/jobs/${currentJob}`).then((x) => x.json());
+      if (st.error && st.stage === "failed") throw new Error(st.error);
+      const total = Math.max(1, st.total_chunks);
+      setProgress(
+        st.total_frames ? st.frames / st.total_frames : st.chunks_done / total,
+        st.stage === "done"
+          ? `Done — ${st.frames} frames, ${st.chunks_done}/${st.total_chunks} chunks, ` +
+            `${st.steps.length} DMD steps in ${st.total_s.toFixed(2)} s.`
+          : `${st.stage} — chunk ${st.chunks_done}/${st.total_chunks}, ` +
+            `${st.frames}/${st.total_frames} frames decoded.`,
+      );
+      if (st.frames > fetched) {
+        const buf = await fetch(`${serverBase}/api/jobs/${currentJob}/frames?from=${fetched}`)
+          .then((x) => x.arrayBuffer());
+        const dv = new DataView(buf);
+        const w2 = dv.getUint32(0, true), h2 = dv.getUint32(4, true);
+        const first = dv.getUint32(8, true), count = dv.getUint32(12, true);
+        if (count > 0) addFrames(w2, h2, new Uint8Array(buf, 16));
+        fetched = first + count;
+      }
+      if (st.stage === "done" || st.stage === "failed") {
+        clearInterval(pollTimer);
+        setEngine(st.stage === "done" ? "ok" : "bad",
+          st.stage === "done"
+            ? `engine: ${serverHealth?.backend || ""} · done in ${st.total_s.toFixed(2)} s`
+            : `job failed: ${st.error || "unknown"}`);
+        setSummary(
+          `Job ${st.id} · ${st.width}×${st.height} · ${st.frames} frames · ` +
+          `seed ${st.seed} · encode ${st.encode_s.toFixed(2)} s · prepare ` +
+          `${st.prepare_s.toFixed(2)} s · denoise ${st.steps.reduce((a, b) => a + b, 0).toFixed(2)} s ` +
+          `(${st.steps.length} steps) · decode ${st.decode_s.toFixed(2)} s · total ${st.total_s.toFixed(2)} s.`,
+        );
+        if (st.stage === "done") startPlay();
+      }
+    } catch (e) {
+      clearInterval(pollTimer);
+      setEngine("bad", `job failed: ${e.message}`);
+      setSummary(`Job failed: ${e.message}`);
+    }
+  }, 500);
+}
+
+// ---- browser mode (fastwan demo.html pattern) -------------------------------
+
+async function showBrowserInfo() {
+  if (bw.loaded) {
+    setEngine("ok", `${bw.loaded} · ${bw.eng.adapter()}`);
+    els.synthetic.hidden = bw.manifest?.model !== "lightx2v";
+    fillExamples(bw.entries.map((e) => e.prompt), bw.manifest?.model === "lightx2v");
+    els.go.disabled = !!job;
+    return;
+  }
+  els.go.disabled = true;
+  if (!CAN_BROWSER) {
+    bwStatus("bad", "This browser has no WebGPU. Use a recent Chrome or Edge (or Safari 26+).");
+    els.bwLoad.disabled = true; return;
+  }
+  if (TINY || !WEIGHTS) {
+    els.bwVariant.innerHTML = `<option value="tiny">tiny · synthetic, no download</option>`;
+    bwStatus("wait", "Load the tiny synthetic model to try the path with no download — or add ?weights=<base URL> for the real weights.");
+    return;
+  }
+  if (!bw.manifest) {
+    try {
+      bw.manifest = await (await fetch(`${WEIGHTS}/manifest.json`, { cache: "no-store" })).json();
+    } catch {
+      bwStatus("bad", `Cannot reach the weights at ${WEIGHTS}.`);
+      return;
+    }
+    els.bwVariant.innerHTML = Object.entries(bw.manifest.variants)
+      .map(([k, v]) => `<option value="${k}">${escHtml(v.label)} · ${mb(v.bytes)}</option>`).join("");
+    const pref = store("lightx2v.variant");
+    if (pref && bw.manifest.variants[pref]) els.bwVariant.value = pref;
+  }
+  bwStatus("wait", "Load the model to run it in this browser.");
+}
+
+// Cache: whole groups, keyed by file, size and group, so a re-uploaded file
+// is fetched again.
+async function cached(key, fetcher) {
+  let c = null;
+  try {
+    c = await caches.open("lightx2v-weights-v1");
+    const hit = await c.match(key);
+    if (hit) return new Uint8Array(await hit.arrayBuffer());
+  } catch {}
+  const bytes = await fetcher();
+  try { await c?.put(key, new Response(bytes)); } catch {}
+  return bytes;
+}
+async function fetchBytes(url, range, onBytes) {
+  const r = await fetch(url, range ? { headers: { Range: `bytes=${range[0]}-${range[1] - 1}` } } : {});
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  const len = range ? range[1] - range[0] : +r.headers.get("Content-Length") || 0;
+  if (!r.body || !len) { const b = new Uint8Array(await r.arrayBuffer()); onBytes?.(b.length); return b; }
+  const out = new Uint8Array(len), rd = r.body.getReader(); let o = 0;
+  for (;;) {
+    const { done, value } = await rd.read();
+    if (done) break;
+    out.set(value, o); o += value.length; onBytes?.(value.length);
+  }
+  if (o !== len) throw new Error(`${url}: got ${o} of ${len} bytes`);
+  return out;
+}
+// safetensors header → groups (the head, then blocks.0 …) of contiguous bytes.
+async function readGroups(url) {
+  const n = Number(new DataView((await fetchBytes(url, [0, 8])).buffer).getBigUint64(0, true));
+  const head = JSON.parse(new TextDecoder().decode(await fetchBytes(url, [8, 8 + n])));
+  const groups = new Map();
+  for (const [name, t] of Object.entries(head)) {
+    if (name === "__metadata__") continue;
+    const m = /^blocks\.(\d+)\./.exec(name), k = m ? +m[1] : -1;
+    if (!groups.has(k)) groups.set(k, { key: k, tensors: [], start: Infinity, end: 0, bytes: 0 });
+    const g = groups.get(k), [a, b] = t.data_offsets;
+    g.tensors.push([name, t]); g.start = Math.min(g.start, a); g.end = Math.max(g.end, b); g.bytes += b - a;
+  }
+  for (const g of groups.values()) {
+    if (g.bytes !== g.end - g.start) {
+      throw new Error(`${url} is not block-ordered (re-export it with lightx2v quantize)`);
+    }
+  }
+  return { dataStart: 8 + n, groups, meta: head.__metadata__ || {} };
+}
+// One group's bytes as a standalone safetensors blob.
+function groupBlob(g, bytes) {
+  const hdr = {};
+  for (const [name, t] of g.tensors) {
+    hdr[name] = { dtype: t.dtype, shape: t.shape, data_offsets: [t.data_offsets[0] - g.start, t.data_offsets[1] - g.start] };
+  }
+  let text = JSON.stringify(hdr);
+  while (text.length % 8) text += " ";
+  const h = new TextEncoder().encode(text), out = new Uint8Array(8 + h.length + bytes.length);
+  new DataView(out.buffer).setBigUint64(0, BigInt(h.length), true);
+  out.set(h, 8); out.set(bytes, 8 + h.length);
+  return out;
+}
+
+async function bwLoad() {
+  els.bwLoad.disabled = true;
+  const tiny = TINY || !WEIGHTS;
+  const key = tiny ? "tiny" : els.bwVariant.value;
+  if (!tiny) store("lightx2v.variant", key);
+  bwStatus("wait", "Starting WebGPU…");
+  if (!bw.mod) { bw.mod = await import("./pkg/lightx2v_web.js"); await bw.mod.default(); }
+  if (bw.eng) { bw.eng.free(); bw.eng = null; bw.loaded = null; }
+  bw.eng = await bw.mod.createEngine(tiny ? "tiny" : bw.manifest.model);
+  if (tiny) {
+    // The synthetic DiT builds in place; the gallery is the prompt list
+    // (any prompt works — its embeddings are seeded randoms, see tinyEmbeds).
+    bw.manifest = { model: "tiny" };
+    bw.entries = GALLERY_PROMPTS.map((p) => ({ prompt: p }));
+    bw.loaded = "tiny · synthetic · in this browser";
+    console.info("lightx2v: WebGPU", bw.eng.adapter(), "|", bw.eng.limits());
+    els.bwLoad.disabled = false; els.bwLoad.textContent = "Reload";
+    bwStatus("ok", "Tiny model ready — no download, structured noise only.");
+    els.size.value = "64x64";
+    showBrowserInfo();
+    return;
+  }
+  const v = bw.manifest.variants[key];
+  const url = `${WEIGHTS}/${v.file}`, { dataStart, groups } = await readGroups(url);
+  const blocks = [...groups.keys()].filter((k) => k >= 0).sort((a, b) => a - b);
+  if (blocks.length !== bw.eng.layers()) {
+    throw new Error(`${v.file} has ${blocks.length} blocks, the model has ${bw.eng.layers()}`);
+  }
+  const taeUrl = `${WEIGHTS}/${bw.manifest.tae.file}`;
+  const total = [...groups.values()].reduce((a, g) => a + g.bytes, 0) + bw.manifest.tae.bytes;
+  let got = 0; const t0 = performance.now();
+  els.bwBar.style.width = "0%";
+  const tick = (n) => { got += n; els.bwBar.style.width = `${(100 * got / total).toFixed(1)}%`; };
+  // Count bytes as they stream in; a group served from the cache counts at once.
+  const load = async (k, size, fetcher) => {
+    let streamed = 0;
+    const bytes = await cached(k, () => fetcher((n) => { streamed += n; tick(n); }));
+    tick(size - streamed);
+    return bytes;
+  };
+  const group = async (g, label) => {
+    bwStatus("wait", `Loading ${label} · ${mb(got)} of ${mb(total)}`);
+    const range = [dataStart + g.start, dataStart + g.end];
+    return groupBlob(g, await load(`${url}?size=${v.bytes}&g=${g.key}`, g.bytes, (on) => fetchBytes(url, range, on)));
+  };
+  for (const k of blocks) bw.eng.addBlock(await group(groups.get(k), `block ${k + 1} of ${blocks.length}`));
+  bw.eng.finishDit(await group(groups.get(-1), "the embedders"));
+  bwStatus("wait", "Loading the decoder…");
+  const tb = await load(`${taeUrl}?size=${bw.manifest.tae.bytes}`, bw.manifest.tae.bytes, (on) => fetchBytes(taeUrl, null, on));
+  bw.eng.loadTae(tb);
+  const gurl = `${WEIGHTS}/${bw.manifest.gallery}`;
+  bw.entries = (await (await fetch(gurl, { cache: "no-store" })).json()).prompts;
+  bw.galleryBase = gurl.slice(0, gurl.lastIndexOf("/") + 1);
+  bw.loaded = `${bw.manifest.name || "LightX2V Wan2.1-T2V-1.3B"} · ${v.label} · in this browser`;
+  console.info("lightx2v: WebGPU", bw.eng.adapter(), "|", bw.eng.limits());
+  els.bwLoad.disabled = false; els.bwLoad.textContent = "Reload";
+  bwStatus("ok", `Model ready in ${((performance.now() - t0) / 1000).toFixed(1)} s.`);
+  showBrowserInfo();
+  if (els.size.querySelector('option[value="480x272"]')) els.size.value = "480x272";
+}
+
+// A Rust panic aborts the wasm module and leaves its promise pending forever;
+// it surfaces only as an uncaught RuntimeError. Fail the call on one, and
+// drop the engine (it cannot be used again) so the next load starts clean.
+function wasmCall(p) {
+  return new Promise((resolve, reject) => {
+    const crash = (e) => {
+      const err = e.reason || e.error || e;
+      if (!(err instanceof WebAssembly.RuntimeError) && !/unreachable|RuntimeError/.test(String(e.message || err))) return;
+      cleanup(); bw.eng = null; bw.loaded = null;
+      els.bwLoad.textContent = "Load model";
+      bwStatus("bad", "The engine crashed; load the model again.");
+      reject(new Error(`the engine crashed (${String(err.message || err)}); see the browser console`));
+    };
+    const cleanup = () => { removeEventListener("error", crash); removeEventListener("unhandledrejection", crash); };
+    addEventListener("error", crash); addEventListener("unhandledrejection", crash);
+    p.then((v) => { cleanup(); resolve(v); }, (e) => { cleanup(); reject(e); });
+  });
+}
+
+function pushFrames(ev) {
+  const { width: w, height: h, count, rgb } = ev, px = w * h;
+  if (w !== fw || h !== fh || frames.length === 0) {
+    fw = w; fh = h;
+    els.canvas.width = w; els.canvas.height = h;
+  }
+  for (let f = 0; f < count; f++) {
+    const img = new ImageData(w, h), d = img.data, off = f * px * 3;
+    for (let i = 0, j = 0; i < px; i++, j += 4) {
+      d[j] = rgb[off + 3 * i]; d[j + 1] = rgb[off + 3 * i + 1];
+      d[j + 2] = rgb[off + 3 * i + 2]; d[j + 3] = 255;
+    }
+    frames.push(new Uint8ClampedArray(d));
+  }
+  if (!playing) drawFrame(frames.length - 1);
+  els.counter.textContent = `${shown + 1} / ${frames.length} frames`;
+}
+
+// Synthetic embeddings for the tiny model: [8, 16] f32 normals seeded by
+// the prompt hash (the same FNV-1a discipline as `lightx2v serve
+// --synthetic`). Only for the dev fallback — real weights use gallery embeds.
+function tinyEmbeds(prompt) {
+  let h = 0xcbf29ce484222325n;
+  for (const b of new TextEncoder().encode(prompt)) h = (h ^ BigInt(b)) * 0x100000001b3n;
+  let s = Number(h & 0xffffffffn) >>> 0 || 1;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  const vals = new Float32Array(8 * 16);
+  for (let i = 0; i < vals.length; i += 2) {
+    const u = Math.max(rnd(), 1e-9), v = rnd();
+    const r = Math.sqrt(-2 * Math.log(u)), t = 2 * Math.PI * v;
+    vals[i] = r * Math.cos(t); vals[i + 1] = r * Math.sin(t);
+  }
+  const hdr = JSON.stringify({ prompt_embeds: { dtype: "F32", shape: [8, 16], data_offsets: [0, 512] } });
+  const text = hdr + " ".repeat((8 - (hdr.length % 8)) % 8);
+  const hb = new TextEncoder().encode(text);
+  const out = new Uint8Array(8 + hb.length + 512);
+  new DataView(out.buffer).setBigUint64(0, BigInt(hb.length), true);
+  out.set(hb, 8); out.set(new Uint8Array(vals.buffer), 8 + hb.length);
+  return out;
+}
+
+async function browserGenerate(width, height, frames) {
+  const prompt = els.prompt.value;
+  const tiny = bw.manifest?.model === "tiny";
+  let emb;
+  if (tiny) {
+    emb = tinyEmbeds(prompt);
+  } else {
+    const entry = bw.entries.find((e) => norm(e.prompt) === norm(prompt));
+    if (!entry) {
+      throw new Error("Pick one of the gallery prompts: the browser engine has no text encoder.");
+    }
+    emb = await cached(bw.galleryBase + entry.file, () => fetchBytes(bw.galleryBase + entry.file, null));
+  }
+  const seed = els.seed.value !== "" ? Math.max(0, Math.floor(+els.seed.value)) : Math.floor(Math.random() * 1e9);
+  const id = Date.now();
+  job = { id, prompt, seed };
+  els.go.disabled = true; els.go.textContent = "Generating…";
+  resetOutput();
+  const totalFrames = frames;
+  let steps = 0, stepTotal = 0, chunksDone = 0, chunksTotal = 0, decoded = 0;
+  const t0 = performance.now();
+  try {
+    await wasmCall(bw.eng.generate(emb, width, height, frames, seed, (ev) => {
+      if (ev.type === "prepared") setProgress(0, "Prepared — denoising…");
+      else if (ev.type === "step") {
+        steps += 1; stepTotal = ev.total;
+        setProgress(
+          chunksTotal ? (chunksDone * stepTotal + ev.index + 1) / (chunksTotal * stepTotal) : (ev.index + 1) / ev.total,
+          `Denoising chunk ${ev.chunk + 1}${chunksTotal ? `/${chunksTotal}` : ""} — DMD step ${ev.index + 1}/${ev.total} (${(ev.ms / 1000).toFixed(2)} s).`,
+        );
+      } else if (ev.type === "chunk") {
+        chunksDone = ev.index + 1; chunksTotal = ev.total;
+        setProgress(chunksDone / chunksTotal, `Chunk ${ev.index + 1}/${ev.total} denoised — decoding…`);
+      } else if (ev.type === "frames") {
+        pushFrames(ev); decoded += ev.count;
+      }
+    }));
+    setProgress(1, `Done — ${decoded} frames in ${((performance.now() - t0) / 1000).toFixed(2)} s.`);
+    setSummary(
+      `Browser (WebGPU) · ${width}×${height} · ${decoded}/${totalFrames} frames · seed ${seed} · ` +
+      `${steps} DMD steps · ${((performance.now() - t0) / 1000).toFixed(2)} s total.`,
+    );
+    startPlay();
+  } catch (e) {
+    setSummary(`Browser generation failed: ${e.message || e}`);
+    throw e;
+  } finally {
+    job = null;
+    els.go.disabled = false; els.go.textContent = "Generate";
+  }
+}
+
+// ---- wiring -------------------------------------------------------------------
+
+const GALLERY_PROMPTS = [
+  "A red fox trots through fresh snow in a birch forest at dawn, its breath steaming, low golden sunlight, shallow depth of field.",
+  "A jazz saxophonist plays on a rain-slick street corner at night, neon signs reflected in puddles, steam rising from a food stall nearby, slow push in.",
+  "A crowded night market in the rain, neon signs reflected in puddles, steam rising from food stalls, handheld camera moving through the crowd.",
+  "Aerial drone shot sweeping along green sea cliffs as waves crash into white foam, overcast sky, cinematic.",
+  "Close-up of hot water pouring in a slow spiral over coffee grounds in a glass pour-over, morning window light, macro detail.",
+];
+
+els.go.onclick = async () => {
+  els.go.disabled = true;
+  try {
+    if (els.modes.value === "browser") {
+      if (!bw.eng) throw new Error("Load the browser engine first.");
+      const [w, h] = els.size.value.split("x").map(Number);
+      await browserGenerate(w, h, parseInt(els.length.value, 10));
+    } else {
+      await runOnServer();
+    }
+  } catch (e) {
+    setEngine("bad", e.message);
+    setSummary(`Failed: ${e.message}`);
+  } finally {
+    els.go.disabled = false;
+  }
+};
+
+els.modes.onchange = () => {
+  const browser = els.modes.value === "browser";
+  els.browserPanel.hidden = !browser;
+  if (browser) {
+    showBrowserInfo();
+  } else {
+    refreshServerHealth();
+    els.size.value = "832x480";
+  }
+};
+els.connect.onclick = async () => {
+  serverBase = els.engineUrl.value.replace(/\/$/, "");
+  await refreshServerHealth();
+};
+els.bwLoad.onclick = () => {
+  bwLoad().catch((err) => {
+    bwStatus("bad", "Loading failed: " + (err.message || err));
+    els.bwLoad.disabled = false;
+  });
+};
+
+// Same-origin server mode by default; fall back to the examples list until
+// the first health check answers.
+fillExamples(GALLERY_PROMPTS, false);
+refreshServerHealth();
+</script>
+</body>
+</html>

@@ -6,6 +6,7 @@ members = [
     "crates/lightx2v-model",
     "crates/lightx2v-wgpu",
     "crates/lightx2v-cli",
+    "crates/lightx2v-web",
 ]
 
 # The wgpu backend is a feature of `lightx2v-cli` (`wgpu`, default-on):

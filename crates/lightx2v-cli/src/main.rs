@@ -13,6 +13,11 @@
 //! video (`<out>.rgb`, interleaved RGB8). Without `--synthetic` it needs a
 //! real checkpoint directory; the UMT5 text encoder is still Phase 3, so
 //! real generation is not available yet.
+//!
+//! `serve` runs the Prompt Studio web UI (see `serve.rs`).
+
+mod gallery;
+mod serve;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use lightx2v_core::{
@@ -20,7 +25,8 @@ use lightx2v_core::{
     config::{DistillConfig, GenerationConfig, MemRopeConfig, TaeConfig, WanConfig},
     geometry::Geometry,
     plan::{plan, Device},
-    weights::{missing, wan_manifest, Synthetic},
+    quant::WeightQuant,
+    weights::{missing, tae_manifest, wan_manifest, SafetensorsDir, Synthetic, WeightSource},
 };
 use lightx2v_cpu::CpuBackend;
 use lightx2v_model::{
@@ -104,6 +110,51 @@ enum Cmd {
         /// Output path prefix.
         #[arg(long, default_value = "clip")]
         out: PathBuf,
+        /// safetensors holding `prompt_embeds` `[L, 4096]`
+        /// (scripts/encode_prompt.py). Without it, real generation needs
+        /// the UMT5 text encoder (Phase 3) and errors.
+        #[arg(long)]
+        embeds: Option<PathBuf>,
+        /// Load-time weight format for plain (non-quantized) tensors:
+        /// native | int8 | int4[-hqq][-gN][-ffn] | fp8.
+        #[arg(long, default_value = "native")]
+        weights: WeightQuant,
+    },
+    /// Write a quantized copy of the DiT: block linears as int8 / 4-bit codes,
+    /// everything else f16 (the browser download format; see
+    /// `lightx2v_core::export`). Load it with --model-dir like the original.
+    Quantize {
+        /// The checkpoint's `transformer/` directory.
+        #[arg(long)]
+        transformer: PathBuf,
+        /// native (all f16) | int8 | int4[-hqq][-gN][-ffn], e.g. int4-hqq-g64.
+        #[arg(long)]
+        weights: WeightQuant,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Serve the Prompt Studio web UI: a local engine (resident DiT/TAEHV)
+    /// plus the prompt-to-clip page at http://<addr>/.
+    Serve {
+        /// Address to bind, e.g. 127.0.0.1:7860.
+        #[arg(long, default_value = "127.0.0.1:7860")]
+        addr: String,
+        /// Use the tiny synthetic model (no download, any prompt accepted).
+        #[arg(long)]
+        synthetic: bool,
+        /// Checkpoint directory with `*.safetensors` (DiT + TAEHV).
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+        /// Gallery directory of precomputed prompt embeddings
+        /// (`gallery.json` + one safetensors file per prompt). Restricts
+        /// which prompts are accepted; mandatory with `--model-dir` until
+        /// the UMT5 text encoder lands in Phase 3.
+        #[arg(long)]
+        gallery: Option<PathBuf>,
+        /// One web origin allowed to call the API from the browser
+        /// (e.g. https://lightx2v.pages.dev). None = same-origin only.
+        #[arg(long)]
+        allow_origin: Option<String>,
     },
 }
 
@@ -279,6 +330,168 @@ fn run_bench<B: Backend>(be: &B, layers: usize) {
     }
 }
 
+fn run_generate_real<B: Backend>(
+    be: &B,
+    dir: &Path,
+    embeds_path: &Path,
+    weights: WeightQuant,
+    frames: usize,
+    seed: u64,
+    out: &Path,
+) {
+    println!("backend: {}", be.name());
+    let cfg = WanConfig::wan_1_3b();
+    let src = match SafetensorsDir::open(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot open model dir {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    };
+    for (manifest, what) in [
+        (wan_manifest(&cfg), "DiT"),
+        (tae_manifest(&TaeConfig::taew2_1()), "TAEHV"),
+    ] {
+        let miss = missing(&src, &manifest);
+        if !miss.is_empty() {
+            eprintln!(
+                "error: checkpoint in {} is missing {} {what} tensor(s), first: {}",
+                dir.display(),
+                miss.len(),
+                miss[..miss.len().min(5)].join(", ")
+            );
+            std::process::exit(1);
+        }
+    }
+    // Prompt embeddings: `prompt_embeds` [L ≤ 512, 4096], zero-padded to the
+    // model's 512 positions, as Diffusers does.
+    let embeds = match SafetensorsDir::open(embeds_path) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: cannot open embeds {}: {e}", embeds_path.display());
+            std::process::exit(1);
+        }
+    };
+    let prompt_embeds = match embeds.raw("prompt_embeds") {
+        Ok((_, shape, _)) => {
+            if shape.len() != 2 || shape[1] != cfg.text_dim || shape[0] > cfg.text_len {
+                eprintln!(
+                    "error: prompt_embeds in {} is {shape:?}, expected [L ≤ {}, {}]",
+                    embeds_path.display(),
+                    cfg.text_len,
+                    cfg.text_dim
+                );
+                std::process::exit(1);
+            }
+            match embeds.get("prompt_embeds", &shape) {
+                Ok(rows) => {
+                    let mut v = vec![0.0f32; cfg.text_len * cfg.text_dim];
+                    v[..rows.len()].copy_from_slice(&rows);
+                    v
+                }
+                Err(e) => {
+                    eprintln!("error: cannot read prompt_embeds: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("error: no prompt_embeds in {}: {e}", embeds_path.display());
+            std::process::exit(1);
+        }
+    };
+    let t0 = Instant::now();
+    let dit = match LightDit::load_with(
+        be,
+        cfg.clone(),
+        MemRopeConfig::default_memrope(),
+        &src,
+        weights,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: failed to load DiT: {e}");
+            std::process::exit(1);
+        }
+    };
+    let tae = match TaeHv::load(be, TaeConfig::taew2_1(), &src) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: failed to load TAEHV: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "loaded real DiT + TAEHV in {:.1} s",
+        t0.elapsed().as_secs_f64()
+    );
+    let pipe = CausalPipeline::new(dit, tae, DistillConfig::dmd2());
+    let (gen, geometry) = if frames == 1005 {
+        (GenerationConfig::demo(), Geometry::LONG_60S)
+    } else {
+        (GenerationConfig::short_clip(), Geometry::SHORT_480P)
+    };
+    let opt = Options {
+        geometry,
+        seed,
+        ffn_chunk: usize::MAX,
+    };
+    let mut timings = Timings::default();
+    let t0 = Instant::now();
+    match pipe.denoise(be, &prompt_embeds, &gen, &opt, &mut timings) {
+        Ok(latent) => {
+            let path = out.with_extension("latent");
+            let bytes: Vec<u8> = latent.iter().flat_map(|v| v.to_le_bytes()).collect();
+            if let Err(e) = std::fs::write(&path, &bytes) {
+                eprintln!("error: cannot write {}: {e}", path.display());
+                std::process::exit(1);
+            }
+            println!(
+                "real latent: {} latent frames ({} video frames), {} elems, \
+                 {:.3} s (prompt {:.3} s, denoise {:.3} s) -> {}",
+                gen.latent_frames,
+                gen.video_frames(),
+                latent.len(),
+                t0.elapsed().as_secs_f64(),
+                timings.prompt_s,
+                timings.denoise_s(),
+                path.display()
+            );
+            match pipe.decode(
+                be,
+                &latent,
+                gen.latent_frames,
+                geometry.height,
+                geometry.width,
+            ) {
+                Ok(video) => {
+                    let vpath = out.with_extension("rgb");
+                    if let Err(e) = std::fs::write(&vpath, &video.rgb) {
+                        eprintln!("error: cannot write {}: {e}", vpath.display());
+                        std::process::exit(1);
+                    }
+                    println!(
+                        "real video: {} frames, {}x{}, {} bytes -> {}",
+                        video.frames,
+                        video.width,
+                        video.height,
+                        video.rgb.len(),
+                        vpath.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error: TAEHV decode failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("error: generate failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_generate_synthetic<B: Backend>(be: &B, seed: u64, out: &Path) {
     println!("backend: {}", be.name());
     let cfg = WanConfig::tiny();
@@ -412,8 +625,10 @@ fn main() {
             frames,
             seed,
             out,
+            embeds,
+            weights,
         } => {
-            let _ = prompt; // No text encoder yet; embeddings are zeros.
+            let _ = prompt; // Without --embeds there is no text encoder yet.
                             // Validate the frame count early (only 81 / 1005 are supported);
                             // the synthetic run itself is always the toy shape (see below).
             if let Err(e) = geometry_for(frames).and_then(|_| generation_for(frames)) {
@@ -432,29 +647,51 @@ fn main() {
                         std::process::exit(2);
                     }
                 };
-                match lightx2v_core::weights::SafetensorsDir::open(&dir) {
-                    Ok(src) => {
-                        let miss = missing(&src, &wan_manifest(&WanConfig::wan_1_3b()));
-                        if !miss.is_empty() {
-                            eprintln!(
-                                "error: checkpoint in {} is missing {} DiT tensor(s), first: {}",
-                                dir.display(),
-                                miss.len(),
-                                miss[..miss.len().min(5)].join(", ")
-                            );
-                            std::process::exit(1);
+                let embeds_path = match embeds {
+                    Some(e) => e,
+                    None => {
+                        match SafetensorsDir::open(&dir) {
+                            Ok(src) => {
+                                let miss = missing(&src, &wan_manifest(&WanConfig::wan_1_3b()));
+                                if !miss.is_empty() {
+                                    eprintln!(
+                                        "error: checkpoint in {} is missing {} DiT tensor(s), first: {}",
+                                        dir.display(),
+                                        miss.len(),
+                                        miss[..miss.len().min(5)].join(", ")
+                                    );
+                                    std::process::exit(1);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("error: cannot open model dir {}: {e}", dir.display());
+                                std::process::exit(1);
+                            }
                         }
                         eprintln!(
-                            "error: real-checkpoint generation is Phase 3 work: the DiT \
-                             manifest validated, but the text encoder (UMT5) is not ported \
-                             yet, so there are no prompt embeddings to condition on"
+                            "error: real-checkpoint generation needs prompt embeddings: pass \
+                             --embeds <file.safetensors> with `prompt_embeds` (see \
+                             scripts/encode_prompt.py), or wait for the UMT5 text encoder \
+                             (Phase 3)"
                         );
                         std::process::exit(1);
                     }
-                    Err(e) => {
-                        eprintln!("error: cannot open model dir {}: {e}", dir.display());
-                        std::process::exit(1);
+                };
+                match select(cli.backend) {
+                    Selected::Cpu(be) => {
+                        run_generate_real(&be, &dir, &embeds_path, weights, frames, seed, &out)
                     }
+                    #[cfg(feature = "wgpu")]
+                    Selected::Wgpu(be) => run_generate_real(
+                        be.as_ref(),
+                        &dir,
+                        &embeds_path,
+                        weights,
+                        frames,
+                        seed,
+                        &out,
+                    ),
+                    Selected::Unavailable(reason) => skip(&reason),
                 }
             }
             match select(cli.backend) {
@@ -462,6 +699,110 @@ fn main() {
                 #[cfg(feature = "wgpu")]
                 Selected::Wgpu(be) => run_generate_synthetic(be.as_ref(), seed, &out),
                 Selected::Unavailable(reason) => skip(&reason),
+            }
+        }
+        Cmd::Quantize {
+            transformer,
+            weights,
+            out,
+        } => {
+            // `native` writes every tensor as f16 (the browser's f16 option).
+            let cfg = WanConfig::wan_1_3b();
+            let t0 = Instant::now();
+            let src = match SafetensorsDir::open(&transformer) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: cannot open {}: {e}", transformer.display());
+                    std::process::exit(1);
+                }
+            };
+            let miss = missing(&src, &wan_manifest(&cfg));
+            if !miss.is_empty() {
+                eprintln!(
+                    "error: {} tensors missing, e.g. {}",
+                    miss.len(),
+                    miss[..miss.len().min(3)].join(", ")
+                );
+                std::process::exit(1);
+            }
+            let tensors = match lightx2v_core::export::quantize_dit(&src, &cfg, weights) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: quantize failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let bytes: usize = tensors.iter().map(|t| t.3.len()).sum();
+            if let Err(e) = lightx2v_core::export::write(
+                &out,
+                &tensors,
+                lightx2v_core::export::metadata(weights),
+            ) {
+                eprintln!("error: cannot write {}: {e}", out.display());
+                std::process::exit(1);
+            }
+            let src_bytes: u64 = std::fs::read_dir(&transformer)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0);
+            println!(
+                "quantize: {} -> {} ({:.2} GiB from {:.2} GiB, {} tensors, {:.1} s)",
+                transformer.display(),
+                out.display(),
+                bytes as f64 / (1 << 30) as f64,
+                src_bytes as f64 / (1 << 30) as f64,
+                tensors.len(),
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        Cmd::Serve {
+            addr,
+            synthetic,
+            model_dir,
+            gallery,
+            allow_origin,
+        } => {
+            let weights = if synthetic {
+                serve::Weights::Synthetic { gallery }
+            } else {
+                match model_dir {
+                    Some(dir) => serve::Weights::Real {
+                        model_dir: dir,
+                        gallery,
+                    },
+                    None => {
+                        eprintln!(
+                            "error: serve needs --synthetic for the tiny random model, or \
+                             --model-dir <dir> with a Wan2.1-T2V-1.3B DMD checkpoint \
+                             (plus --gallery <dir> until the UMT5 text encoder lands)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            };
+            let settings = serve::Settings {
+                addr,
+                weights,
+                allow_origin,
+            };
+            let run = match select(cli.backend) {
+                Selected::Cpu(be) => serve::serve(settings, move |s, shared, rx| {
+                    serve::engine(be, s, shared, rx)
+                }),
+                #[cfg(feature = "wgpu")]
+                Selected::Wgpu(be) => serve::serve(settings, move |s, shared, rx| {
+                    serve::engine(*be, s, shared, rx)
+                }),
+                Selected::Unavailable(reason) => skip(&reason),
+            };
+            if let Err(e) = run {
+                eprintln!("error: serve failed: {e}");
+                std::process::exit(1);
             }
         }
     }

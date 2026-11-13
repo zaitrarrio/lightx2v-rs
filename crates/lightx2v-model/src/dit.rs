@@ -236,6 +236,158 @@ pub struct Workspace<B: Backend> {
     pub rope_sin: B::Buf,
 }
 
+/// One transformer block's weights, loaded from `src`.
+fn load_block<B: Backend>(
+    be: &B,
+    src: &dyn WeightSource,
+    shapes: &Shapes,
+    cfg: &WanConfig,
+    l: usize,
+    quant: WeightQuant,
+) -> Result<Block<B>> {
+    let d = cfg.dim();
+    let lin = |keys: &[&str]| load_linear(be, src, shapes, keys, quant);
+    let vec = |k: &str, n: usize| -> Result<B::Buf> { Ok(be.upload(&src.get(k, &[n])?)) };
+    let p = |s: &str| format!("blocks.{l}.{s}");
+    Ok(Block {
+        qkv: lin(&[&p("attn1.to_q"), &p("attn1.to_k"), &p("attn1.to_v")])?,
+        norm_q1: vec(&p("attn1.norm_q.weight"), d)?,
+        norm_k1: vec(&p("attn1.norm_k.weight"), d)?,
+        out1: lin(&[&p("attn1.to_out.0")])?,
+        q2: lin(&[&p("attn2.to_q")])?,
+        kv2: lin(&[&p("attn2.to_k"), &p("attn2.to_v")])?,
+        norm_q2: vec(&p("attn2.norm_q.weight"), d)?,
+        norm_k2: vec(&p("attn2.norm_k.weight"), d)?,
+        out2: lin(&[&p("attn2.to_out.0")])?,
+        norm2_w: vec(&p("norm2.weight"), d)?,
+        norm2_b: vec(&p("norm2.bias"), d)?,
+        ffn1: lin(&[&p("ffn.net.0.proj")])?,
+        ffn2: lin(&[&p("ffn.net.2")])?,
+        gate: if src.has_linear(&p("to_gate_compress")) {
+            Some(lin(&[&p("to_gate_compress")])?)
+        } else {
+            None
+        },
+        table: src.get(&p("scale_shift_table"), &[1, 6, d])?,
+    })
+}
+
+/// The DiT's non-block weights (patch embedder, text embedder, output
+/// projection, timestep MLP) plus the head modulation table.
+struct Head<B: Backend> {
+    patch: Linear<B>,
+    text1: Linear<B>,
+    text2: Linear<B>,
+    proj_out: Linear<B>,
+    time: TimeEmbed,
+}
+
+fn load_head<B: Backend>(
+    be: &B,
+    src: &dyn WeightSource,
+    shapes: &Shapes,
+    cfg: &WanConfig,
+    quant: WeightQuant,
+) -> Result<Head<B>> {
+    let d = cfg.dim();
+    let lin = |keys: &[&str]| load_linear(be, src, shapes, keys, quant);
+    let ce = "condition_embedder";
+    Ok(Head {
+        patch: lin(&["patch_embedding"])?,
+        text1: lin(&[&format!("{ce}.text_embedder.linear_1")])?,
+        text2: lin(&[&format!("{ce}.text_embedder.linear_2")])?,
+        proj_out: lin(&["proj_out"])?,
+        time: TimeEmbed {
+            l1w: src.get(
+                &format!("{ce}.time_embedder.linear_1.weight"),
+                &[d, cfg.freq_dim],
+            )?,
+            l1b: src.get(&format!("{ce}.time_embedder.linear_1.bias"), &[d])?,
+            l2w: src.get(&format!("{ce}.time_embedder.linear_2.weight"), &[d, d])?,
+            l2b: src.get(&format!("{ce}.time_embedder.linear_2.bias"), &[d])?,
+            pw: src.get(&format!("{ce}.time_proj.weight"), &[6 * d, d])?,
+            pb: src.get(&format!("{ce}.time_proj.bias"), &[6 * d])?,
+            head_table: src.get("scale_shift_table", &[1, 2, d])?,
+        },
+    })
+}
+
+/// Incremental DiT loading: one transformer block at a time, then the head.
+/// The browser engine (`lightx2v-web`) streams a block-ordered checkpoint
+/// with one HTTP Range request per block, so wasm memory holds one block at
+/// a time; the native `load_with` path is this builder fed from one source.
+pub struct DitBuilder<B: Backend> {
+    cfg: WanConfig,
+    memrope: MemRopeConfig,
+    quant: WeightQuant,
+    shapes: Shapes,
+    blocks: Vec<Block<B>>,
+}
+
+impl<B: Backend> DitBuilder<B> {
+    pub fn new(cfg: WanConfig, memrope: MemRopeConfig, quant: WeightQuant) -> Self {
+        let d = cfg.dim();
+        let layers = cfg.layers;
+        let mut shapes: Shapes = lightx2v_core::weights::wan_manifest(&cfg)
+            .into_iter()
+            .collect();
+        for l in 0..layers {
+            shapes.insert(format!("blocks.{l}.to_gate_compress.weight"), vec![d, d]);
+        }
+        Self {
+            cfg,
+            memrope,
+            quant,
+            shapes,
+            blocks: Vec::with_capacity(layers),
+        }
+    }
+
+    /// Blocks loaded so far (the page compares this with `cfg.layers`).
+    pub fn loaded(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Load the next block (`blocks.<loaded>.*`) from `src`. The caller
+    /// hands it exactly one block's tensors — a block-ordered checkpoint
+    /// sliced into per-block safetensors blobs.
+    pub fn add_block(&mut self, be: &B, src: &dyn WeightSource) -> Result<usize> {
+        let l = self.blocks.len();
+        if l >= self.cfg.layers {
+            return Err(Error::Weights(format!(
+                "block {l} is past the model's {} layers",
+                self.cfg.layers
+            )));
+        }
+        let b = load_block(be, src, &self.shapes, &self.cfg, l, self.quant)?;
+        self.blocks.push(b);
+        Ok(self.blocks.len())
+    }
+
+    /// Load the head tensors and complete the DiT. Fails unless every
+    /// block was added first.
+    pub fn finish(self, be: &B, src: &dyn WeightSource) -> Result<LightDit<B>> {
+        if self.blocks.len() != self.cfg.layers {
+            return Err(Error::Weights(format!(
+                "DiT has {} of {} blocks; the head cannot load yet",
+                self.blocks.len(),
+                self.cfg.layers
+            )));
+        }
+        let head = load_head(be, src, &self.shapes, &self.cfg, self.quant)?;
+        Ok(LightDit {
+            patch: head.patch,
+            text1: head.text1,
+            text2: head.text2,
+            blocks: self.blocks,
+            proj_out: head.proj_out,
+            time: head.time,
+            cfg: self.cfg,
+            memrope: self.memrope,
+        })
+    }
+}
+
 impl<B: Backend> LightDit<B> {
     pub fn load(
         be: &B,
@@ -253,63 +405,11 @@ impl<B: Backend> LightDit<B> {
         src: &dyn WeightSource,
         quant: WeightQuant,
     ) -> Result<Self> {
-        let d = cfg.dim();
-        let mut shapes: Shapes = lightx2v_core::weights::wan_manifest(&cfg)
-            .into_iter()
-            .collect();
-        for l in 0..cfg.layers {
-            shapes.insert(format!("blocks.{l}.to_gate_compress.weight"), vec![d, d]);
+        let mut b = DitBuilder::new(cfg, memrope, quant);
+        for _ in 0..b.cfg.layers {
+            b.add_block(be, src)?;
         }
-        let lin = |keys: &[&str]| load_linear(be, src, &shapes, keys, quant);
-        let vec = |k: &str, n: usize| -> Result<B::Buf> { Ok(be.upload(&src.get(k, &[n])?)) };
-        let mut blocks = Vec::with_capacity(cfg.layers);
-        for l in 0..cfg.layers {
-            let p = |s: &str| format!("blocks.{l}.{s}");
-            blocks.push(Block {
-                qkv: lin(&[&p("attn1.to_q"), &p("attn1.to_k"), &p("attn1.to_v")])?,
-                norm_q1: vec(&p("attn1.norm_q.weight"), d)?,
-                norm_k1: vec(&p("attn1.norm_k.weight"), d)?,
-                out1: lin(&[&p("attn1.to_out.0")])?,
-                q2: lin(&[&p("attn2.to_q")])?,
-                kv2: lin(&[&p("attn2.to_k"), &p("attn2.to_v")])?,
-                norm_q2: vec(&p("attn2.norm_q.weight"), d)?,
-                norm_k2: vec(&p("attn2.norm_k.weight"), d)?,
-                out2: lin(&[&p("attn2.to_out.0")])?,
-                norm2_w: vec(&p("norm2.weight"), d)?,
-                norm2_b: vec(&p("norm2.bias"), d)?,
-                ffn1: lin(&[&p("ffn.net.0.proj")])?,
-                ffn2: lin(&[&p("ffn.net.2")])?,
-                gate: if src.has_linear(&p("to_gate_compress")) {
-                    Some(lin(&[&p("to_gate_compress")])?)
-                } else {
-                    None
-                },
-                table: src.get(&p("scale_shift_table"), &[1, 6, d])?,
-            });
-        }
-        let ce = "condition_embedder";
-        let time = TimeEmbed {
-            l1w: src.get(
-                &format!("{ce}.time_embedder.linear_1.weight"),
-                &[d, cfg.freq_dim],
-            )?,
-            l1b: src.get(&format!("{ce}.time_embedder.linear_1.bias"), &[d])?,
-            l2w: src.get(&format!("{ce}.time_embedder.linear_2.weight"), &[d, d])?,
-            l2b: src.get(&format!("{ce}.time_embedder.linear_2.bias"), &[d])?,
-            pw: src.get(&format!("{ce}.time_proj.weight"), &[6 * d, d])?,
-            pb: src.get(&format!("{ce}.time_proj.bias"), &[6 * d])?,
-            head_table: src.get("scale_shift_table", &[1, 2, d])?,
-        };
-        Ok(Self {
-            patch: lin(&["patch_embedding"])?,
-            text1: lin(&[&format!("{ce}.text_embedder.linear_1")])?,
-            text2: lin(&[&format!("{ce}.text_embedder.linear_2")])?,
-            proj_out: lin(&["proj_out"])?,
-            blocks,
-            time,
-            cfg,
-            memrope,
-        })
+        b.finish(be, src)
     }
 
     /// Host timestep conditioning for one DMD timestep, uploaded.

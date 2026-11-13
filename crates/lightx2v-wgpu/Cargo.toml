@@ -15,6 +15,15 @@ pollster = "0.4.0"
 # created, this is a headless compute backend).
 wgpu = { version = "30.0.1", default-features = false, features = ["vulkan", "wgsl"] }
 
+# On wasm32 the browser backend needs wgpu's `webgpu` feature (adapter
+# discovery through the browser's navigator.gpu) plus the wasm-bindgen
+# glue for the Promise-based async readback (`download_async`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "webgpu"] }
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+js-sys = "0.3.107"
+
 [dev-dependencies]
 lightx2v-cpu = { version = "0.1.0", path = "../lightx2v-cpu" }
 lightx2v-model = { version = "0.1.0", path = "../lightx2v-model" }
