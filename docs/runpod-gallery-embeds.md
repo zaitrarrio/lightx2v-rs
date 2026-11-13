@@ -51,6 +51,31 @@ here until `ssh.runpod.io` is allowlisted. Also: deploy with env
 (the account's registered key is unknown). Total spend for the 6
 stalled attempts was ~$1.50, almost all of it idle waiting time.
 
+**2026-11-13 no-SSH retry — SUCCESS.** The user chose the no-SSH path and
+it worked on the third deploy attempt. Deploys 1–2 (secure RTX 4090, then
+secure RTX 5090) failed instantly at deploy time with
+`SUPPLY_CONSTRAINT` ("no longer any instances available") — no pod
+created, no spend. Deploy 3 (community RTX A4000, $0.17/hr,
+`runpod/pytorch:2.2.0-rc.229-cu1300-torch291-ubuntu2404`) created pod
+`7synm9ys15zuoo`, runtime at ~3 min, `_done.json` at ~11.5 min after
+runtime (model download + 12 encodes), terminated immediately after
+verification. **Spend for this job ≈ $0.05** (16 min wall × $0.17/hr;
+failed deploys cost $0). The contract that made it work, all verified
+before deploying: GraphQL `env` is `[{key, value}]`; `dockerArgs` is the
+container's command (a bare shell string, treated as CMD — it replaces
+the image's Cmd `/start.sh` while the NVIDIA entrypoint execs it, so
+the pod runs the job script instead of the default start script and
+exits when the script exits). Image config verified from the registry
+(Entrypoint `/opt/nvidia/nvidia_entrypoint.sh`, Cmd `/start.sh`).
+Job script `scripts/runpod-gallery-job.sh` reports via `_status.json` /
+`_done.json` / `_error.json` in `v1/gallery/`; all 13 files verified
+publicly (12 embeds × 8,388,696 B, gallery.json 2,722 B; 2 embeds
+spot-checked: F32 [512, 4096], rows past real tokens zeroed). The pod
+showed desired RUNNING with a stale runtime after the job finished, so
+it was terminated explicitly via `podTerminate` and confirmed gone
+from `runpod pods`. Note: a sibling agent's `h3-rs-dbg2` pod was
+RUNNING at the same time — not this job's, left alone.
+
 - Prefer a CPU pod with >= 24 GB RAM (`cpuTypes` query) if cheaper than GPU.
 - Else the cheapest GPU pod with >= 24 GB RAM: community-cloud RTX A5000
   (~$0.27/hr) / L4 (~$0.39/hr) / RTX 4090 (~$0.34/hr) — check live
