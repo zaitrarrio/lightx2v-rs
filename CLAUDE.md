@@ -42,8 +42,11 @@ h3-rs, or fastvideo-rs.
   per-attention-layer after each layer; eviction folds the oldest
   recent frame into the EMA slots before dropping it.
 - **History-contrast**: `corrected = base + w·(teacher_with − teacher_without)`.
-- **Features off by default.** No wgpu/cuda deps in Phase 1; GPU code
-  is gated behind features that are OFF by default.
+- **Features off by default — except wgpu, which is on by default in
+  the CLI.** The `wgpu` crate is behind the CLI's `wgpu` feature
+  (`default = ["wgpu"]`); `cargo build -p lightx2v-cli
+  --no-default-features` builds CPU-only, and `--backend wgpu` on
+  that build prints a clean skip. No CUDA dep yet (Phase 3).
 
 ## Layout
 
@@ -55,13 +58,27 @@ h3-rs, or fastvideo-rs.
   `sparse` (VSA tile plan), `weights` (mmap safetensors), `backend`,
   `plan` (VRAM estimator).
 - `crates/lightx2v-cpu` — `CpuBackend`, the f32 oracle.
+- `crates/lightx2v-wgpu` — `WgpuBackend`, the full `Backend` trait on
+  wgpu 30: f16-packed weights (`u32` pairs via `unpack2x16float`, no
+  `shader-f16`), Q8/Q4 in-shader dequant, one flash kernel with dense /
+  VSA-fine / causal-masked modes, VSA pool + coarse + top-k, the
+  MemRoPE KV cache on-device (`[rows, heads·d]`, temporal/kinds on
+  the host). Shaders in `src/shaders/`. `try_new()` returns `None`
+  when no adapter answers — callers skip, never fail. `is_software()`
+  reports a CPU rasterizer (fine for conformance, meaningless for
+  timing).
 - `crates/lightx2v-model` — `LightDit` (DiT over `Backend`),
   `CausalPipeline` (3-latent-frame chunks, 4 DMD steps per chunk,
   caches persist across chunks), `TaeHv` (load validates the manifest;
-  `decode` is `NotImplemented` until Phase 2), `check.rs` (11 checks),
+  `decode` decodes 4-latent-frame chunks to RGB on any backend;
+  stored-quantized conv weights are dequantized on the host at load),
+  `check.rs` (11 checks, `run_all_on<B: Backend>` for any backend),
   `tests/conformance.rs` (tiny safetensors fixture vs an independent
-  f32 reference rollout in `tests/reference.rs`).
-- `crates/lightx2v-cli` — `lightx2v plan/check/bench/generate`.
+  f32 reference rollout in `tests/reference.rs`; TAEHV decode shape /
+  determinism / chunk-invariance test).
+- `crates/lightx2v-cli` — `lightx2v plan/check/bench/generate`,
+  `--backend cpu|wgpu|auto` (default `auto`; unavailable backend =
+  clean skip, exit 0).
 - `scripts/reference/make_fixture.py` — pure-stdlib safetensors
   writer for the tiny DiT + tiny TAEHV fixtures.
 
@@ -72,24 +89,43 @@ cargo build --workspace --offline
 cargo test --workspace --offline
 cargo clippy --workspace --offline -- -D warnings
 cargo fmt --check
-./target/debug/lightx2v check
+./target/debug/lightx2v check [--backend cpu|wgpu|auto]
 ./target/debug/lightx2v plan [--frames 1005] [--offload block]
-./target/debug/lightx2v generate --synthetic --out clip.latent
+./target/debug/lightx2v generate --synthetic --out clip
+# -> clip.latent (raw f32) + clip.rgb (interleaved RGB8)
+cargo build -p lightx2v-cli --no-default-features --offline  # CPU-only
 ```
 
-## Phase 1 status (2026-11-13)
+## Phase 2 status (2026-11-13)
 
-- `cargo test --workspace`: 34 passed, 0 failed (28 core, 2 cpu,
-  4 conformance). `lightx2v check`: 11/11. Clippy `-D warnings`
-  clean, `cargo fmt --check` clean.
+- `cargo test --workspace`: **37 passed, 0 failed** (28 core, 2 model,
+  4 conformance, 3 wgpu — the wgpu 3 skip on this VM: no adapter).
+  `lightx2v check --backend cpu`: 11/11. `check --backend wgpu`:
+  clean skip, exit 0. Clippy `-D warnings` clean, `cargo fmt --check`
+  clean.
 - Conformance: 2-chunk tiny-DiT rollout vs the direct f32 reference,
   max abs error **7.2e-7** (f32 accumulation-order noise; the test
   asserts max-abs < 1e-5, not relative error, because relative error
   blows up on near-zero elements).
-- Known stubs for Phase 2/3: TAEHV decode (`NotImplemented`), real
-  DiT weights (generate needs `--model-dir`), UMT5 text encoding
-  (embeddings are zeros in Phase 1), wgpu/CUDA backends, NVFP4
-  micro-block quant, relativistic RoPE for open-ended streams,
-  H3 backbone variant.
+- TAEHV decode works on CPU: 3 latent frames → 9 video frames at
+  64×64, deterministic on repeat decode, bit-identical whether
+  decoded as one 6-frame chunk or 4+2 chunks (MemBlock memory carried
+  across the boundary). `generate --synthetic` writes `clip.latent`
+  + `clip.rgb` (9 frames, 64×64, 110,592 bytes).
+- wgpu conformance is **not yet run on hardware**: no Vulkan driver
+  on this VM (`/usr/share/vulkan/icd.d/` absent, lavapipe not
+  installable — apt lists unreachable). The wgpu crate builds offline
+  (wgpu 30, default-features off + `vulkan`/`wgsl` only; `pollster`
+  0.4.0, the cached version), the shaders were reviewed against the
+  CPU oracle line by line, and the tests assert the skip path — but
+  no wgpu kernel has executed. First run on a real GPU:
+  `lightx2v check --backend wgpu` (expect 11/11) and
+  `cargo test -p lightx2v-wgpu` (expect the DiT rollout < 1e-5 and
+  the decode < 1e-3 with f32 weights; the f16 decode error is
+  printed and bounded at 5e-2).
+- Known stubs for Phase 3: real DiT weights (`generate` needs
+  `--model-dir` and still errors — UMT5 text encoding is the
+  blocker), CUDA backend, NVFP4 micro-block quant, relativistic RoPE
+  for open-ended streams, H3 backbone variant.
 - Do not push: report the ghapi push-local command to the parent.
   `research/` is excluded from the push set.

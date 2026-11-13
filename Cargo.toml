@@ -4,9 +4,14 @@ members = [
     "crates/lightx2v-core",
     "crates/lightx2v-cpu",
     "crates/lightx2v-model",
+    "crates/lightx2v-wgpu",
     "crates/lightx2v-cli",
 ]
 
+# The wgpu backend is a feature of `lightx2v-cli` (`wgpu`, default-on):
+# `cargo build -p lightx2v-cli --no-default-features` builds a CPU-only
+# CLI. The `lightx2v-wgpu` crate itself is always a workspace member;
+# its tests skip cleanly when no adapter answers.
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

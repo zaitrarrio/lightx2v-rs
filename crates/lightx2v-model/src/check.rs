@@ -48,24 +48,30 @@ fn rel_err(a: &[f32], b: &[f32]) -> f32 {
 }
 
 pub fn run_all() -> Vec<CheckResult> {
-    let be = CpuBackend;
+    run_all_on(&CpuBackend)
+}
+
+/// The same 11 checks on any backend, against host-computed references
+/// (the CPU oracle matches them by construction, so a wgpu run measures
+/// the wgpu backend against the same target).
+pub fn run_all_on<B: Backend>(be: &B) -> Vec<CheckResult> {
     let mut out = vec![
-        check_linear(&be),
-        check_layer_norm(&be),
-        check_attention(&be),
-        check_causal_attention_mask(&be),
-        check_sparse_is_dense_at_zero_sparsity(&be),
-        check_patchify_roundtrip(&be),
-        check_dmd_step(&be),
-        check_quant(&be),
-        check_rope(&be),
+        check_linear(be),
+        check_layer_norm(be),
+        check_attention(be),
+        check_causal_attention_mask(be),
+        check_sparse_is_dense_at_zero_sparsity(be),
+        check_patchify_roundtrip(be),
+        check_dmd_step(be),
+        check_quant(),
+        check_rope(),
         check_memrope_cache(),
     ];
     out.push(check_history_contrast());
     out
 }
 
-fn check_linear(be: &CpuBackend) -> CheckResult {
+fn check_linear<B: Backend>(be: &B) -> CheckResult {
     // 4x3 matrix, hand-computed reference.
     let x = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
     let w = vec![
@@ -96,7 +102,7 @@ fn check_linear(be: &CpuBackend) -> CheckResult {
     }
 }
 
-fn check_layer_norm(be: &CpuBackend) -> CheckResult {
+fn check_layer_norm<B: Backend>(be: &B) -> CheckResult {
     let x = vec![1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
     let xb = be.upload(&x);
     let ob = be.alloc(8);
@@ -128,7 +134,7 @@ fn check_layer_norm(be: &CpuBackend) -> CheckResult {
     }
 }
 
-fn check_attention(be: &CpuBackend) -> CheckResult {
+fn check_attention<B: Backend>(be: &B) -> CheckResult {
     let (heads, sq, sk, d) = (1usize, 2, 3, 4);
     let mut rng = lightx2v_core::rng::Rng::new(3);
     let q = rng.normal(heads * sq * d);
@@ -167,7 +173,7 @@ fn check_attention(be: &CpuBackend) -> CheckResult {
     }
 }
 
-fn check_causal_attention_mask(be: &CpuBackend) -> CheckResult {
+fn check_causal_attention_mask<B: Backend>(be: &B) -> CheckResult {
     // 3 queries, 3 keys, mask = lower-triangular: query i sees keys <= i.
     let (heads, sq, sk, d) = (1usize, 3, 3, 4);
     let mut rng = lightx2v_core::rng::Rng::new(5);
@@ -218,7 +224,7 @@ fn check_causal_attention_mask(be: &CpuBackend) -> CheckResult {
     }
 }
 
-fn check_sparse_is_dense_at_zero_sparsity(be: &CpuBackend) -> CheckResult {
+fn check_sparse_is_dense_at_zero_sparsity<B: Backend>(be: &B) -> CheckResult {
     // Sparsity 0 keeps every tile, gate 0 kills the coarse term: sparse
     // must equal dense attention.
     let (heads, d) = (1usize, 8);
@@ -248,7 +254,7 @@ fn check_sparse_is_dense_at_zero_sparsity(be: &CpuBackend) -> CheckResult {
     }
 }
 
-fn check_patchify_roundtrip(be: &CpuBackend) -> CheckResult {
+fn check_patchify_roundtrip<B: Backend>(be: &B) -> CheckResult {
     let (c, t, h, w, p) = (4usize, 3, 8, 8, 2);
     let mut rng = lightx2v_core::rng::Rng::new(13);
     let latent = rng.normal(c * t * h * w);
@@ -266,7 +272,7 @@ fn check_patchify_roundtrip(be: &CpuBackend) -> CheckResult {
     }
 }
 
-fn check_dmd_step(be: &CpuBackend) -> CheckResult {
+fn check_dmd_step<B: Backend>(be: &B) -> CheckResult {
     let x = vec![1.0f32, 2.0, 3.0];
     let v = vec![0.5f32, 0.5, 0.5];
     let noise = vec![0.1f32, -0.2, 0.3];
@@ -285,7 +291,7 @@ fn check_dmd_step(be: &CpuBackend) -> CheckResult {
     }
 }
 
-fn check_quant(_be: &CpuBackend) -> CheckResult {
+fn check_quant() -> CheckResult {
     let mut rng = lightx2v_core::rng::Rng::new(17);
     let w = rng.uniform(8 * 256, 1.0);
     let q8 = Q8::quantize(&w, 8, 256);
@@ -313,7 +319,7 @@ fn check_quant(_be: &CpuBackend) -> CheckResult {
     }
 }
 
-fn check_rope(_be: &CpuBackend) -> CheckResult {
+fn check_rope() -> CheckResult {
     let cfg = WanConfig::wan_1_3b();
     let t = rope_table(&cfg, (2, 3, 4), 0);
     let err = if t.cos[..64].iter().all(|&c| c == 1.0) && t.sin[..64].iter().all(|&s| s == 0.0) {

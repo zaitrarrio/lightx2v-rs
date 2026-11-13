@@ -246,10 +246,18 @@ impl<B: Backend> CausalPipeline<B> {
         Ok(latent)
     }
 
-    /// Decode a denoised latent to RGB. Phase 1: the TAEHV weights load,
-    /// the decode itself returns [`Error::NotImplemented`].
-    pub fn decode(&self, be: &B, latent: &[f32], gen: &GenerationConfig) -> Result<Video> {
-        self.tae.decode(be, latent, gen)
+    /// Decode a denoised latent to RGB via the TAEHV decoder.
+    /// `latent_frames` is the latent frame count; `height`/`width` are the
+    /// VIDEO dimensions (see [`TaeHv::decode`]).
+    pub fn decode(
+        &self,
+        be: &B,
+        latent: &[f32],
+        latent_frames: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<Video> {
+        self.tae.decode(be, latent, latent_frames, height, width)
     }
 }
 

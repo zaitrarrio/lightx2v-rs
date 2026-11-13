@@ -1,0 +1,20 @@
+[package]
+name = "lightx2v-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck = "1.25.2"
+half = "2.7.1"
+lightx2v-core = { version = "0.1.0", path = "../lightx2v-core" }
+pollster = "0.4.0"
+# Minimal feature set: Vulkan compute + WGSL only. The default feature
+# set also enables GLES, which pulls `wayland-sys` — not in this
+# machine's offline registry cache (and unneeded: no surface is ever
+# created, this is a headless compute backend).
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan", "wgsl"] }
+
+[dev-dependencies]
+lightx2v-cpu = { version = "0.1.0", path = "../lightx2v-cpu" }
+lightx2v-model = { version = "0.1.0", path = "../lightx2v-model" }

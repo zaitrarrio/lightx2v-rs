@@ -7,12 +7,17 @@ shape: one fused `Backend` op vocabulary, a CPU f32 reference backend that
 every other backend is checked against, and a causal chunk pipeline with a
 bounded MemRoPE KV cache.
 
-Phase 1 is a real, compiling, tested scaffold: the full core math
+Phase 1 was a real, compiling, tested scaffold: the full core math
 (config / schedule / RoPE / MemRoPE / history-contrast / quant /
 safetensors loading / VRAM plan), a CPU reference backend, a DiT over the
 `Backend` trait, a causal 3-latent-frame chunk pipeline with a 4-step DMD
-sampler, and a `lightx2v` CLI. TAEHV decode, real DiT weights, UMT5 text
-encoding, and wgpu/CUDA backends are Phase 2/3 — see `docs/design.md`.
+sampler, and a `lightx2v` CLI. **Phase 2 (this version) adds the wgpu
+backend and a real TAEHV decode**: the full `Backend` trait runs on
+WebGPU (f16-packed weights, fused kernels, VSA sparse attention, the
+MemRoPE KV cache on-device), `TaeHv::decode` decodes latents to RGB on
+both backends, and the CLI gains `--backend cpu|wgpu|auto`. Real DiT
+weights, UMT5 text encoding, and CUDA are Phase 3 — see
+`docs/design.md`.
 
 ## What it implements (verified numbers)
 
@@ -48,26 +53,47 @@ crates/lightx2v-core   config, schedule, rope, memrope, history-contrast,
                        quant (Q8/Q4/FP8 e4m3), safetensors loader, Backend
                        trait, VRAM plan
 crates/lightx2v-cpu    CPU f32 reference backend (the oracle)
+crates/lightx2v-wgpu   WebGPU backend: full Backend trait, WGSL shaders,
+                       f16-packed weights, VSA sparse attention, MemRoPE
+                       KV cache on-device
 crates/lightx2v-model  DiT over Backend, causal chunk pipeline, 4-step DMD
-                       sampler, TAEHV stub, conformance checks
+                       sampler, TAEHV decode, conformance checks
 crates/lightx2v-cli    `lightx2v` binary: plan / check / bench / generate
+                       (--backend cpu|wgpu|auto, default auto)
 scripts/reference/     make_fixture.py — tiny safetensors fixture generator
 docs/design.md         what is fused and why, what is verified, what is next
 ```
+
+## Backends
+
+| Backend | Status | Notes |
+| --- | --- | --- |
+| `cpu` | Reference, verified | f32, straightforward loops; the oracle every other backend is checked against. `lightx2v check --backend cpu`: 11/11. |
+| `wgpu` | Implemented, conformance **pending a real GPU** | Full `Backend` trait on wgpu 30 (Vulkan / WebGPU). Builds offline; on this VM no adapter answers (no Vulkan driver, lavapipe unavailable), so its 3 conformance tests exercise the clean skip path and its 11 checks have not run on hardware yet. Run `lightx2v check --backend wgpu` on a machine with a GPU. |
+| `cuda` | Phase 3 | Not started. |
+
+`--backend auto` (the default) uses wgpu when an adapter answers, else
+the CPU. When the selected backend is unavailable the command prints a
+clean skip reason and exits 0 — a missing GPU is not a failure. The
+wgpu crate is behind the CLI's `wgpu` feature (on by default);
+`cargo build -p lightx2v-cli --no-default-features` builds CPU-only.
 
 ## Build / test / run
 
 ```sh
 cargo build --workspace --offline
-cargo test --workspace --offline        # 34 passed, 0 failed (this VM)
+cargo test --workspace --offline        # 37 passed, 0 failed (this VM;
+                                        # 3 wgpu tests skip: no adapter)
 cargo clippy --workspace -- -D warnings # clean
 cargo fmt --check                       # clean
 
 ./target/debug/lightx2v plan            # 81-frame clip, 16 GiB budget
 ./target/debug/lightx2v plan --frames 1005 --offload block
-./target/debug/lightx2v check           # 11 checks, 11 passed
+./target/debug/lightx2v check                       # 11 checks, 11 passed (cpu)
+./target/debug/lightx2v check --backend wgpu       # 11/11, or a clean skip
 ./target/debug/lightx2v bench --layers 1
-./target/debug/lightx2v generate --synthetic --out clip.latent
+./target/debug/lightx2v generate --synthetic --out clip
+# -> clip.latent (raw f32) + clip.rgb (interleaved RGB8, 9 frames 64x64)
 ```
 
 `plan` for the 81-frame clip at 16 GiB: peak **7638.8 MiB, fits**. The
@@ -75,7 +101,8 @@ cargo fmt --check                       # clean
 not fit 16 GiB; `--offload block` keeps 189,199,572 of 2,837,993,600
 weight bytes resident. `generate` without `--synthetic` needs
 `--model-dir` with a Wan2.1-T2V-1.3B DMD checkpoint and errors cleanly
-otherwise; real-checkpoint generation and TAEHV decode are Phase 2.
+otherwise; real-checkpoint generation is Phase 3 (UMT5 text encoding
+is still missing).
 
 ## Lineage
 

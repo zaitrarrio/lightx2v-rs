@@ -1,8 +1,10 @@
 # Design — lightx2v-rs
 
-Phase 1 design notes. Everything in "Verified" was actually run on this
+Phase 2 design notes. Everything in "Verified" was actually run on this
 CPU-only VM on 2026-11-13; numbers quoted from the papers / upstream
-configs are marked as such and were not re-measured here.
+configs are marked as such and were not re-measured here. The wgpu
+backend (§9) is implemented and reviewed but has not executed on a GPU
+yet — that is stated explicitly wherever it matters.
 
 ## 1. What this is
 
@@ -80,7 +82,7 @@ tanh_clamp — extended for this port with:
   dense attention, which is a check case);
 - `weight_fp8` / FP8 e4m3 quantize/dequantize — the LightX2V FP8
   path, dequantize-as-reference contract (NVFP4 micro-block is
-  Phase 2);
+  Phase 3);
 - `OffloadGranularity` (None / Model / Block / Disk) + a memory
   plan fn — LightX2V's block offload, surfaced in `plan.rs` and the
   CLI so a 60 s rollout can be planned against a real VRAM budget
@@ -138,7 +140,7 @@ rotates by original temporal indices (block RoPE).
 κ 1.01, ≤ 20 iters — fastwan semantics) weight-only, plus FP8 E4M3
 (`Fp8E4M3`, `FP8_GROUP 128`, `FP8_E4M3_MAX 448.0`) with f32↔e4m3
 codecs for the LightX2V FP8 path. NVFP4 (micro-block FP4 + E4M3
-scales, the LightX2V headline quant) is Phase 2: the h3-rs contract
+scales, the LightX2V headline quant) is Phase 3: the h3-rs contract
 warning applies — ComfyUI single-file NVFP4 checkpoints need a key
 map + unswizzled-scale variant and are not loadable yet.
 
@@ -211,19 +213,26 @@ behavioral oracle; Luminal is frozen.
 ## 7. Verified (actually run, 2026-11-13, CPU-only VM)
 
 - `cargo build --workspace --offline`: passes. `cargo test
-  --workspace --offline`: **34 passed, 0 failed** (28 core, 2 cpu,
-  4 conformance). `cargo clippy --workspace --offline -- -D warnings`:
-  clean. `cargo fmt --check`: clean.
-- `lightx2v check`: **11/11 passed** (linear, layer_norm,
+  --workspace --offline`: **37 passed, 0 failed** (28 core, 2 model,
+  4 conformance, 3 wgpu — the wgpu 3 skip: no adapter on this VM).
+  `cargo clippy --workspace --offline -- -D warnings`:
+  clean. `cargo fmt --check`: clean. CPU-only build
+  (`cargo build -p lightx2v-cli --no-default-features`) passes too.
+- `lightx2v check --backend cpu`: **11/11 passed** (linear, layer_norm,
   attention, causal_attention_mask, sparse==dense@0-sparsity-gate-0,
   patchify/unpatchify roundtrip, dmd_step, quant q8/q4/fp8,
   rope origin identity, memrope cache bounded + sinks + ema,
-  history-contrast residual).
+  history-contrast residual). `check --backend wgpu` prints a clean
+  skip (`no WebGPU adapter answered`) and exits 0; `check --backend
+  auto` falls back to cpu, 11/11.
 - Conformance (`crates/lightx2v-model/tests/conformance.rs`):
   2-chunk tiny-DiT rollout vs an independent f32 reference
   (`tests/reference.rs`), max abs error **7.2e-7**; KV-cache test
   bounds the cache at 12 frames and keeps the sinks; TAEHV decode
-  asserts `NotImplemented`; quantize flag parses. The test asserts
+  test decodes 3 latent frames → 9 video frames at 64×64,
+  deterministic on repeat decode, and bit-identical whether decoded
+  as one 6-frame chunk or 4+2 chunks (MemBlock memory carried across
+  the boundary); quantize flag parses. The test asserts
   max-abs < 1e-5, not relative error: relative error blows up on
   near-zero elements (9.6e-5 rel at 7.2e-7 abs is f32
   accumulation-order noise, not a semantic difference).
@@ -234,10 +243,11 @@ behavioral oracle; Luminal is frozen.
   12 frames in both.
 - `lightx2v bench --layers 1`: tiny DiT, 1 chunk × 4 DMD steps,
   **0.203 s** total (load 0.001 s, prompt 0.001 s, denoise 0.202 s).
-- `lightx2v generate --synthetic --out clip.latent`: 3 latent
-  frames (9 video frames), 768 elems, **0.215 s**; writes raw f32
-  latents (TAEHV decode is Phase 2). `generate` without
-  `--synthetic` errors cleanly naming the missing model dir.
+- `lightx2v generate --synthetic --out clip`: 3 latent
+  frames (9 video frames), 768 elems, **0.28 s**; writes `clip.latent`
+  (raw f32) **and** `clip.rgb` (TAEHV-decoded, 9 frames 64×64,
+  110,592 bytes). `generate` without `--synthetic` errors cleanly
+  naming the missing model dir / UMT5 blocker.
 
 Two real bugs found and fixed during conformance (both caught by
 tests, not by inspection):
@@ -253,17 +263,110 @@ tests, not by inspection):
    (max abs 4.148 before, 0.0 after). Fix: channel-major
    everywhere, matching the checkpoint contract.
 
-## 8. What is next (Phase 2/3)
+## 8. What is next (Phase 3)
 
-- **Phase 2**: wgpu backend (+ CUDA if a GPU is available),
-  NVFP4 micro-block quant, real DiT weights (`--model-dir`
-  generation end-to-end), TAEHV decode (the `TaeHv::decode`
-  interface exists; it returns `NotImplemented` now), UMT5 text
-  encoding (embeddings are zeros in Phase 1), relativistic RoPE
-  for open-ended streams.
-- **Phase 3**: H3 backbone variant, Cloudflare edge serve
-  (fastvideo-edge pattern), sequence-parallel / multi-GPU plan,
-  `docs/runs/` measurements on named hardware. No speed claim
-  until measured.
+- **Phase 3**: CUDA backend, NVFP4 micro-block quant, real DiT
+  weights (`--model-dir` generation end-to-end — the blocker is UMT5
+  text encoding, not the DiT or the decoder), UMT5 text encoding,
+  relativistic RoPE for open-ended streams, H3 backbone variant,
+  Cloudflare edge serve (fastvideo-edge pattern), sequence-parallel /
+  multi-GPU plan, `docs/runs/` measurements on named hardware. No
+  speed claim until measured.
 - Never deploy or quote the paper's VBench numbers as measured
   here — they are the upstream paper's, cited in §1.
+
+## 9. Phase 2: wgpu backend + TAEHV decode
+
+### What fused and why
+
+Phase 2 adds no new `Backend` ops: the whole trait from §3 runs on
+wgpu, including the LightX2V extensions — `causal_attention` with a
+block mask, `kv_cache_put` (append-or-overwrite), `sparse_attention`
+(VSA), and `kv_cache_memrope_update`. One WGSL kernel per op, the
+same fusion rationale as §3: the DiT is written once against the
+trait, so the wgpu backend is a new impl of ~30 ops, not a new
+model, and tensors stay on-device across a whole block.
+
+### Buffer / KV-cache layout
+
+- Activations are f32 buffers; weights are f16 pairs packed in `u32`
+  and unpacked with core `unpack2x16float` (no `shader-f16`
+  dependency). A weight whose values do not fit f16 (or whose row
+  length is odd) stays f32 — never silently clipped. Q8/Q4 weights
+  stay packed and are dequantized in the shader; FP8 weights are
+  dequantized on the host into the same f16-packed form. `wgpu`
+  validates shaders at pipeline creation (runtime, only when a
+  device exists), so shader syntax errors do not surface on a
+  headless machine — every shader was re-read against the CPU oracle
+  line by line instead.
+- Dispatches are recorded into one command encoder and submitted in
+  batches of 64; a host write or read flushes first, so queue
+  ordering always matches program order. Params travel as a fresh
+  UNIFORM buffer per dispatch (padded to a multiple of 4 u32s).
+- KV cache: one layer's K/V on-device as `[rows, heads·d]`
+  row-major over tokens — the CPU oracle's layout, so `kv_cache_kv`
+  is a transpose away from attention's `[heads, rows, d]` input. The
+  temporal index and `SlotKind` of every row live on the host (small
+  `Vec`s); the device never sees them. `kv_cache_put` decides
+  append-vs-overwrite on the host and issues one `kv_pack` kernel
+  either way. `kv_cache_memrope_update` runs the same metadata
+  simulation as the CPU oracle and executes it with two kernels:
+  `ema_fold` (in place, one frame into an EMA slot, via a temp
+  buffer so no buffer is bound read-write and read at once) and
+  `kv_compact` (gather rows by an index map, zero-filling freshly
+  seeded EMA frames).
+
+### Shader list (`crates/lightx2v-wgpu/src/shaders/`)
+
+| Shader | Ops |
+| --- | --- |
+| `common.wgsl` | `gelu_tanh` / `tanh_safe` (exp form; WGSL `tanh` overflows to NaN on some drivers), `wg_index` |
+| `linear.wgsl` | 64×64 tiled GEMM, `{W_TYPE}`/`{W_LOAD}` templated per storage (f32 / f16-packed / Q8 / Q4); row offsets for chunked FFN |
+| `norm.wgsl` | mode 0 plain LN, mode 1 residual+LN in place on `h` (the norm reads the unrounded sum, as the CPU does); affine or AdaLN-mod |
+| `head_split.wgsl` | one workgroup per token; RMS only when a weight is given (v passes through raw); interleaved-pair RoPE; scatter to `[heads, rows, d]` |
+| `flash.wgsl` | one-row-per-thread online-softmax attention, three modes: 0 dense, 1 VSA fine stage (selected tiles + `coarse·gate`), 2 causal masked (`mask[qi·sk+ki]`). Invalid keys score −1e30 and are skipped; an all-masked row outputs 0 (the CPU reference would produce NaN there — the DiT never has an all-masked row, every query sees the sink frames) |
+| `conv.wgsl` | implicit GEMM, NCHW stride 1 pad k/2; concat + nearest-×2 upsample by address in the tile loader; epilogues none / relu / AddRelu / Prelu |
+| `elementwise.wgsl` | ops 0 gate_residual, 1 dmd_step, 2 tanh_clamp, 3 patchify, 4 unpatchify (channel-major — fastwan's op 4 was channel-last and is corrected here), 5 kv_pack, 6 kv_unpack, 7 ema_fold |
+| `vsa_pool.wgsl` | one workgroup per (tile, head); mean-pool Q/K/V over the tile's real tokens |
+| `vsa_coarse.wgsl` | one workgroup per (query tile, head); coarse scores + softmax + coarse out, top-k by bitwise threshold search on order-preserving float keys (ties to the lower index, as the CPU's sort) |
+| `kv_compact.wgsl` | gather rows by a u32 map, PAD = zero row |
+
+Phase 2 deliberately uses the simple one-row-per-thread flash kernel
+(fastwan's fallback shape), not the register-tiled f16 variant: the
+tiled kernel is Phase 3 perf work, not a correctness gap. Likewise
+there is no profiler and no f16-math kernel yet.
+
+### TAEHV decode
+
+`TaeHv::decode` (in `crates/lightx2v-model/src/taehv.rs`) ports
+fastwan-model's decoder with the same three exact rewrites: TGrow
+(1×1) before the upsample, upsample fused into the next conv,
+concat fused into the MemBlock's first conv. Latents decode in
+4-latent-frame chunks; each MemBlock carries its last input frame
+across the boundary (the reference's sequential memory), and the
+first 3 video frames are trimmed as priming. `decode` takes the
+video dimensions explicitly — the toy runs denoise under the demo
+profile while their video is 64×64. Conv weights are plain backend
+weights; a checkpoint storing a conv weight quantized is dequantized
+on the host at load (`conv2d` has no quantized path).
+
+### What is verified vs what still needs a real GPU
+
+Verified on this VM (§7): the wgpu crate builds offline and passes
+clippy/fmt; the 3 wgpu conformance tests run and take the clean skip
+path; the TAEHV decode is verified on CPU (shape, determinism,
+chunk-invariance); the CLI's `--backend` selection and skip paths
+are verified end to end (cpu 11/11, wgpu skip exit 0, auto falls
+back to cpu, CPU-only build skips wgpu with the feature reason).
+
+**Not verified: no wgpu kernel has executed.** This VM has no
+Vulkan driver (`/usr/share/vulkan/icd.d/` does not exist, no
+lavapipe `.so` anywhere, `apt install mesa-vulkan-drivers` has no
+installation candidate — apt lists are unreachable). First run on a
+real GPU: `lightx2v check --backend wgpu` (expect 11/11) and
+`cargo test -p lightx2v-wgpu` (tiny-DiT rollout vs CPU < 1e-5 with
+f32 weights; TAEHV decode vs CPU < 1e-3 with f32 weights, and the
+f16-packed decode error printed and bounded at 5e-2). The wgpu
+tests force `allow_f16_weights = false` for the strict comparisons
+so a failure at 1e-5 is a kernel bug, not f16 rounding — if a check
+fails there, investigate, don't loosen the tolerance.

@@ -177,19 +177,70 @@ fn cpu_kv_cache_memrope_bounds_and_keeps_sinks() {
 }
 
 #[test]
-fn taehv_decode_is_not_implemented_yet() {
+fn taehv_decode_shape_deterministic_and_chunk_invariant() {
+    // Tiny TAEHV: 4 latent channels, 8x8 latent spatial -> 64x64 video.
     let dir = fixture_dir();
     let be = CpuBackend;
     let src = SafetensorsDir::open(&dir).unwrap();
     let tae = TaeHv::load(&be, TaeConfig::tiny(), &src).unwrap();
-    let err = tae
-        .decode(
-            &be,
-            &[0.0f32; 4 * 3 * 8 * 8],
-            &GenerationConfig::short_clip(),
-        )
-        .unwrap_err();
-    assert!(matches!(err, lightx2v_core::Error::NotImplemented(_)));
+
+    // 3 latent frames -> 9 video frames at 64x64.
+    let mut rng = Rng::new(7);
+    let latent = rng.normal(4 * 3 * 8 * 8);
+    let video = tae.decode(&be, &latent, 3, 64, 64).unwrap();
+    assert_eq!(video.frames, 9, "3 latent frames -> 4*3-3 video frames");
+    assert_eq!((video.width, video.height), (64, 64));
+    assert_eq!(video.rgb.len(), 9 * 64 * 64 * 3);
+    // Deterministic: decoding the same latent twice gives identical bytes.
+    let again = tae.decode(&be, &latent, 3, 64, 64).unwrap();
+    assert_eq!(video.rgb, again.rgb);
+    // Non-degenerate: the synthetic weights produce varied output, not a
+    // flat field.
+    let distinct: std::collections::HashSet<u8> = video.rgb.iter().copied().collect();
+    assert!(
+        distinct.len() > 10,
+        "only {} distinct byte values",
+        distinct.len()
+    );
+    let mean = video.rgb.iter().map(|&b| b as f64).sum::<f64>() / video.rgb.len() as f64;
+    assert!((1.0..254.0).contains(&mean), "mean byte {mean:.1}");
+
+    // Chunk invariance: 6 latent frames decoded as one 6-frame chunk must
+    // equal the same latent decoded as 4+2 chunks (the MemBlock memory
+    // carried across the boundary is the reference's sequential memory).
+    // decode_chunk takes frame-major [frames, C, h, w]; transpose first.
+    let latent6 = rng.normal(4 * 6 * 8 * 8);
+    let mut z6 = vec![0.0f32; 6 * 4 * 8 * 8];
+    for fi in 0..6 {
+        for c in 0..4 {
+            for y in 0..8 {
+                for x in 0..8 {
+                    z6[((fi * 4 + c) * 8 + y) * 8 + x] = latent6[((c * 6 + fi) * 8 + y) * 8 + x];
+                }
+            }
+        }
+    }
+    let mut st = tae.state();
+    let one = tae.decode_chunk(&be, &mut st, &z6, 6, 8, 8);
+    assert_eq!(one.frames, 21, "6 latent frames -> 4*6-3 video frames");
+    assert_eq!((one.width, one.height), (64, 64));
+    let mut st2 = tae.state();
+    let first = tae.decode_chunk(&be, &mut st2, &z6[..4 * 4 * 8 * 8], 4, 8, 8);
+    let second = tae.decode_chunk(&be, &mut st2, &z6[4 * 4 * 8 * 8..], 2, 8, 8);
+    assert_eq!(first.frames + second.frames, 21);
+    let mut split = first.data.clone();
+    split.extend_from_slice(&second.data);
+    assert_eq!(one.data.len(), split.len());
+    let max_abs = one
+        .data
+        .iter()
+        .zip(&split)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_abs == 0.0,
+        "chunked decode differs from single-chunk decode by {max_abs:.3e}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

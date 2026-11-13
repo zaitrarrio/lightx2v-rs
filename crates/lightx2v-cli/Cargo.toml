@@ -8,8 +8,15 @@ license.workspace = true
 name = "lightx2v"
 path = "src/main.rs"
 
+[features]
+# The wgpu backend (default-on). `--no-default-features` builds a
+# CPU-only CLI that only offers `--backend cpu`.
+default = ["wgpu"]
+wgpu = ["dep:lightx2v-wgpu"]
+
 [dependencies]
 lightx2v-core = { version = "0.1.0", path = "../lightx2v-core" }
 lightx2v-cpu = { version = "0.1.0", path = "../lightx2v-cpu" }
 lightx2v-model = { version = "0.1.0", path = "../lightx2v-model" }
+lightx2v-wgpu = { version = "0.1.0", path = "../lightx2v-wgpu", optional = true }
 clap = { version = "4.6.7", features = ["derive"] }
