@@ -341,6 +341,25 @@ fn run_bench<B: Backend>(be: &B, layers: usize) {
     print_profile(be);
 }
 
+/// One-line per-chunk summary (mean/min/max/first/last). Flatness across
+/// chunks is the MemRoPE-cache-bounding check: early chunks run on a
+/// filling cache, later chunks on a full 12-frame one.
+fn print_chunk_stats(t: &Timings) {
+    if t.chunks_s.is_empty() {
+        return;
+    }
+    let n = t.chunks_s.len();
+    let sum: f64 = t.chunks_s.iter().sum();
+    let lo = t.chunks_s.iter().fold(f64::MAX, |a, &b| a.min(b));
+    let hi = t.chunks_s.iter().fold(0.0f64, |a, &b| a.max(b));
+    println!(
+        "chunks: {n} x mean {:.3} s (min {lo:.3} s, max {hi:.3} s, first {:.3} s, last {:.3} s)",
+        sum / n as f64,
+        t.chunks_s[0],
+        t.chunks_s[n - 1]
+    );
+}
+
 fn run_generate_real<B: Backend>(
     be: &B,
     dir: &Path,
@@ -468,6 +487,7 @@ fn run_generate_real<B: Backend>(
                 timings.denoise_s(),
                 path.display()
             );
+            print_chunk_stats(&timings);
             let dt0 = Instant::now();
             let decoded = pipe.decode(
                 be,
@@ -508,7 +528,7 @@ fn run_generate_real<B: Backend>(
     }
 }
 
-fn run_generate_synthetic<B: Backend>(be: &B, seed: u64, out: &Path) {
+fn run_generate_synthetic<B: Backend>(be: &B, seed: u64, frames: usize, out: &Path) {
     println!("backend: {}", be.name());
     let cfg = WanConfig::tiny();
     let src = Synthetic { seed: 1 };
@@ -521,14 +541,14 @@ fn run_generate_synthetic<B: Backend>(be: &B, seed: u64, out: &Path) {
     let pipe = CausalPipeline::new(dit, tae, DistillConfig::dmd2());
     let embeds = vec![0.0f32; cfg.text_len * cfg.text_dim];
     let mut timings = Timings::default();
-    // The synthetic run is always the toy shape: the tiny DiT (2 layers,
-    // dim 24) on 3 latent frames of a 64x64 clip.
+    // The synthetic run honors --frames (81 or 1005, validated by the
+    // dispatcher): same tiny DiT, 64x64 toy geometry, full rollout.
     let toy_gen = GenerationConfig {
-        latent_frames: 3,
+        latent_frames: Geometry::latent_frames(frames),
         ..GenerationConfig::short_clip()
     };
     let toy_geometry = Geometry {
-        frames: 9,
+        frames,
         height: 64,
         width: 64,
     };
@@ -557,6 +577,7 @@ fn run_generate_synthetic<B: Backend>(be: &B, seed: u64, out: &Path) {
                 timings.denoise_s(),
                 path.display()
             );
+            print_chunk_stats(&timings);
             let dt0 = Instant::now();
             let decoded = pipe.decode(be, &latent, toy_gen.latent_frames, 64, 64);
             let decode_s = dt0.elapsed().as_secs_f64();
@@ -651,7 +672,7 @@ fn main() {
         } => {
             let _ = prompt; // Without --embeds there is no text encoder yet.
                             // Validate the frame count early (only 81 / 1005 are supported);
-                            // the synthetic run itself is always the toy shape (see below).
+                            // the synthetic run honors it too (7 chunks at 81, 84 at 1005).
             if let Err(e) = geometry_for(frames).and_then(|_| generation_for(frames)) {
                 eprintln!("error: {e}");
                 std::process::exit(2);
@@ -716,9 +737,9 @@ fn main() {
                 }
             }
             match select(cli.backend) {
-                Selected::Cpu(be) => run_generate_synthetic(&be, seed, &out),
+                Selected::Cpu(be) => run_generate_synthetic(&be, seed, frames, &out),
                 #[cfg(feature = "wgpu")]
-                Selected::Wgpu(be) => run_generate_synthetic(be.as_ref(), seed, &out),
+                Selected::Wgpu(be) => run_generate_synthetic(be.as_ref(), seed, frames, &out),
                 Selected::Unavailable(reason) => skip(&reason),
             }
         }

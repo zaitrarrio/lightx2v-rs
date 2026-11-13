@@ -41,6 +41,8 @@ pub struct Timings {
     pub prompt_s: f64,
     pub steps_s: Vec<f64>,
     pub decode_s: f64,
+    /// Wall seconds per denoised chunk, in rollout order.
+    pub chunks_s: Vec<f64>,
 }
 
 impl Timings {
@@ -234,10 +236,12 @@ impl<B: Backend> CausalPipeline<B> {
             let chunk_latent = be.download(&x);
             let off = ci * chunk_latent_len;
             latent[off..off + chunk_latent_len].copy_from_slice(&chunk_latent);
+            let chunk_s = ct0.elapsed().as_secs_f64();
+            t.chunks_s.push(chunk_s);
             on(Event::Chunk {
                 index: ci,
                 total: chunks,
-                secs: ct0.elapsed().as_secs_f64(),
+                secs: chunk_s,
             });
         }
         on(Event::Latent {

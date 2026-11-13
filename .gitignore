@@ -2,6 +2,7 @@
 research/
 *.safetensors
 *.latent
+*.rgb
 models/
 *.bin
 *.pt
