@@ -223,6 +223,140 @@ The CPU backend expands the f4 file to f32 on load (5,413 MiB in the
 plan's f32 row vs 2,706.5 MiB f16), which is what makes load itself
 marginal.
 
+### Vast.ai (real GPU): first wgpu execution — two bugs found, no clip
+
+2026-11-13, on-demand instance via the Vast.ai API (connector:
+`~/workspace/custom-connectors/custom.vast-ai/`). Cheapest offer
+meeting the spec at the time (1 GPU, gpu_ram ≥ 16 GiB, rentable,
+on-demand, direct ports, disk ≥ 50 GiB): **offer 60331183, NVIDIA
+CMP 170HX, 64 GiB VRAM, $0.2948/hr**, disk 50 GiB, host in Latvia,
+40,198 MiB CPU RAM. Image `vastai/pytorch:cuda-12.8.1-auto`
+(tag verified on Docker Hub first). The job ran from the instance's
+onstart script (`scripts/vast-bench-job.sh`, committed with this
+section): apt + rustup + `cargo build --release` + public-R2
+downloads + the benchmark sequence, results served on port 8080 and
+echoed to stdout. Full log retrieved via the Vast.ai logs API
+(`PUT /instances/request_logs/{id}/` → `result_url`); see
+[Retrieval](#retrieval) for why the other two tiers failed.
+
+| step | value |
+|---|---|
+| boot (create → `running`) | 279 s (image cached on the host) |
+| `cargo build --release` | 31 s (30.16 s) |
+| weights downloaded + verified | f4 877,080,928 B, TAEHV 22,642,902 B, fox embed 8,388,696 B — all byte-exact |
+| GPU | NVIDIA CMP 170HX, driver 610.43.03, 65,536 MiB VRAM, Vulkan 1.3.275 |
+| real DiT + TAEHV load | **7.7 s** (vs 34.6 s CPU load on this VM) |
+
+| run | wall | peak RSS | exit | result |
+|---|---|---|---|---|
+| `check --backend wgpu` | 0.68 s | 253.1 MiB | 1 | **10/11** — see the sparse failure below |
+| `bench --backend wgpu --layers 30` | 1.49 s | 306.1 MiB | 0 | 1.097 s total (load 0.005, prompt 0.154, denoise 0.918) |
+| `bench --backend cpu --layers 30` | 0.06 s | 10.0 MiB | 0 | 0.056 s total (same as this VM — single-threaded) |
+| `generate --backend wgpu --frames 81` | **778.23 s** | 1,700.8 MiB | **101** | **panicked in a buffer copy — no outputs** |
+
+`check --backend wgpu` in full (first real wgpu kernel execution
+anywhere — the dense kernels are correct):
+
+```
+PASS linear                                 max_abs_err=0.000e0 tol=1e-6
+PASS layer_norm                             max_abs_err=1.192e-7 tol=1e-6
+PASS attention                              max_abs_err=1.192e-7 tol=1e-6
+PASS causal_attention_mask                  max_abs_err=2.980e-8 tol=1e-5
+FAIL sparse==dense@0-sparsity-gate-0        max_abs_err=7.001e-1 tol=1e-5
+PASS patchify/unpatchify roundtrip          max_abs_err=0.000e0 tol=1e-6
+PASS dmd_step                               max_abs_err=0.000e0 tol=1e-6
+PASS quant q8/q4/fp8 roundtrip              max_abs_err=6.552e-2 tol=2e-1
+PASS rope origin identity                   max_abs_err=0.000e0 tol=0e0
+PASS memrope cache bounded + sinks + ema    max_abs_err=0.000e0 tol=1e-6
+PASS history-contrast residual              max_abs_err=0.000e0 tol=1e-6
+11 checks, 10 passed, 1 failed
+```
+
+**Bug 1 — the VSA sparse path is wrong on GPU.** Dense attention
+passes at 1.19e-7, but sparse-vs-dense disagrees by **0.70** — the
+sparse kernel's output is essentially wrong, not a precision issue.
+This is independent of the generate failure below.
+
+**Bug 2 — the real-scale generate dies in a buffer copy after
+778 s of denoise compute.** The GPU sat at 100% utilization for
+~12 min (verified via the instance status: `gpu_util` 99.99%,
+temp 48 °C), then:
+
+```
+thread 'main' panicked at wgpu-30.0.1/src/backend/wgpu_core.rs:2678:18:
+wgpu error: Validation Error
+
+Caused by:
+  In a CommandEncoder
+    Copy at offset 0 for 86274048 bytes would end up overrunning the bounds of the Source buffer of size 57520128
+```
+
+The denoise kernels ran fine; the failure is in a copy/readback
+path. The copy sites in `lightx2v-wgpu` (`download()`,
+`lib.rs:304`/`778`, and `copy()`, `lib.rs:~801`) all assume 4
+bytes/element (`b.len * 4`); the panicking copy asked for
+86,274,048 B from a 57,520,128 B source — some buffer's `len`
+disagrees with its allocation by ~1.5× at real scale. The
+per-chunk latent download (`pipeline.rs:236`) is only ~1.2 MB, so
+the failing copy is elsewhere in the denoise path; the KV-cache
+ops are the prime suspects by code reading (`cache_grow` /
+`cache_ema_fold` / `kv_cache_kv`), but that is **not proven** —
+pinning the exact call needs `RUST_BACKTRACE=1` on a GPU run.
+No "real latent" line ever printed, so denoise never returned;
+the 1005-frame run was skipped by the script's gate (81-frame
+failed). The `bench --backend wgpu` run printed no per-op profile
+(`lightx2v-wgpu` still has no `profile_report()`).
+
+**What this means for the browser failure.** The user's browser
+attempt failed fast with no progress event, so the binding-limit
+refusal is still the best fit for *that* failure. But these two
+bugs are now the next blockers in line: the browser engine uses
+the same wgpu backend (`download_async` has the same `len * 4`
+assumption, and the KV-cache `copy()` path is shared), so a
+browser run that got past the binding limit would hit the copy
+panic ~13 min into denoise, and the sparse error would corrupt
+the latent even if the copy were fixed. Real generation is
+blocked on two independent wgpu correctness bugs, not on speed.
+
+#### Retrieval
+
+All three tiers were attempted; only the logs API worked:
+
+1. **SSH — blocked.** `ssh -p 13236 root@ssh6.vast.ai` dies at
+   the egress proxy (`Connection reset by 198.19.0.1 port 3128`),
+   same as RunPod. The account's registered keys do not include
+   this VM's key either, so SSH was doubly unavailable.
+2. **HTTP on the direct port — blocked.** The onstart script did
+   start `python3 -m http.server 8080` (pid 6474 in the log) and
+   the port was mapped (8080/tcp → HostPort 23934), but `curl`
+   from this VM times out — the egress proxy does not allow
+   CONNECT to an arbitrary IP:port. No clip files existed to
+   fetch anyway (generate failed before writing any).
+3. **Logs API — worked.** `PUT /instances/request_logs/{id}/`
+   with `{"tail": 300}` returns a `result_url`; a plain GET on
+   it returns the full container log (12,798 chars here). Every
+   number in this section comes from that log — the script tees
+   all output to `timings.txt` and prints `summary.json` to
+   stdout, so nothing was lost. The logs API is the retrieval
+   channel for future Vast.ai jobs.
+
+#### Attempts and spend
+
+Four creates; three died before the benchmark, all destroyed
+in the same run, none left running:
+
+| # | offer / instance | outcome |
+|---|---|---|
+| 1 | V100 $0.0556/hr, 60548459 | **bad image tag** — `vastai/pytorch:2.2.0-rc.229-…` does not exist (that tag is RunPod's, not Vast.ai's); daemon `manifest unknown`, instance stopped |
+| 2 | RTX 3090 $0.1222/hr, 60549331 | **host CDI failure** — `failed to inject CDI devices: unresolvable CDI devices …/gpu=0: unknown`; host-side GPU attach broken |
+| 3 | V100 $0.0556/hr, 60549897 | booted in 836 s, then **rustup toolchain download failed** mid-way (`static.rust-lang.org` dropped); the job script was hardened with retries (3× rustup `--profile minimal`, 2× cargo build, 3× curl `--retry`) before the next create |
+| 4 | CMP 170HX $0.2948/hr, 60551623 | the run above; boot 279 s, destroyed 22:42 UTC after retrieval |
+
+Total spend ≈ **$0.35** (instance 4: ~58 min × $0.3026/hr ≈
+$0.29; the three failed ones ≈ $0.06 combined). The V100 offer
+vanished from the bundles between attempts 1 and 4 — offers churn,
+so re-check live before creating.
+
 ### Serve generation
 
 Nothing new to measure here: the [Serve](#serve-lightx2v-serve---synthetic-release)
@@ -512,41 +646,52 @@ already a kernel; the CPU fix is for parity runs and debugging only.
 
 ## What is NOT measured
 
-- **No wgpu kernel has executed anywhere in this repo's history.**
-  `--backend wgpu` cleanly skips on this VM (no adapter). All GPU
-  numbers — kernel times, the flash/causal attention speed, the
-  implicit-GEMM conv, end-to-end clip time — are unmeasured.
-- **No real 832x480 denoise — characterized, not completed.** One
-  careful run ([Generation](#generation-denoise--decode--rollout)):
-  died in **load**, not denoise, at 31.17 s / 5,664.6 MiB peak RSS,
-  exit -9; an earlier run did complete load in 34.6 s, so load is
-  knife-edge, and denoise would need ~4.8 GiB more on top. The
-  analytic model above is the substitute until a GPU machine runs it.
+- **wgpu kernels HAVE now executed — and found two bugs.**
+  First real execution was 2026-11-13 on Vast.ai
+  ([Vast.ai](#vastai-real-gpu-first-wgpu-execution--two-bugs-found-no-clip)):
+  dense kernels are correct (attention 1.19e-7), but the VSA sparse
+  path is wrong by 0.70 and the real-scale generate dies in a buffer
+  copy after 778 s of denoise compute. Both are correctness bugs, not
+  speed. The per-op GPU profile is still unmeasured — `lightx2v-wgpu`
+  has no `profile_report()`, so GPU runs only give wall-clock totals.
+- **No real 832x480 denoise has completed on any backend.** The GPU
+  run above computed for 778 s at 100% GPU and then panicked in a
+  copy before returning a latent; the CPU run died in load. The
+  analytic model above is still the substitute for a finished run.
 - **No browser execution.** wasm builds but was never run in a
   browser here; phone/GPU playtest is the gate. The error-surfacing
   fix is in (commit `580c5f5`) and the capture procedure for the next
   attempt is in [Generation](#generation-denoise--decode--rollout).
+  Note the Vast.ai finding: even past the binding limit, the browser
+  would hit the same copy panic and sparse error, since it shares
+  the wgpu backend.
 - **No real-model test clip.** The only saved clips are synthetic
   toy-scale (`clip1005.latent` / `.rgb`, 1005 frames at 64x64). No
   video from the real weights exists anywhere.
 - **Gallery embeds exist now, UMT5 still unmeasured.** The 12
   gallery embeds are live on R2 and one was the `--embeds` arg of
-  the OOM run above; the UMT5 encoder itself is still unmeasured.
+  the Vast.ai generate run; the UMT5 encoder itself is still unmeasured.
 - **No quantize re-run.** Export timings are the Studio build's
   recorded numbers (see above).
 
 ## GPU checklist (run on the user's machine)
 
+Items 1–3 are DONE on Vast.ai (2026-11-13, CMP 170HX) — see
+[Vast.ai](#vastai-real-gpu-first-wgpu-execution--two-bugs-found-no-clip)
+for the numbers. What is left is the fix-then-rerun loop and the
+two items never attempted:
+
 ```sh
-# 1. Conformance on the real backend (expect 11/11)
+# 1. Conformance on the real backend — DONE, 10/11 (sparse fails by 0.70)
 ./target/release/lightx2v check --backend wgpu
 
-# 2. Denoise wall time + per-op profile (CPU profile only for now;
-#    wgpu has no profile_report() yet — compare wall time against the
-#    CPU 64–66 ms at 30 layers and the analytic ~1.2e14 FLOP/chunk)
+# 2. Denoise wall time — DONE, 1.097 s for the tiny 30-layer bench
+#    (no per-op GPU profile: wgpu has no profile_report() yet)
 LIGHTX2V_PROFILE=1 ./target/release/lightx2v bench --backend wgpu --layers 30
 
-# 3. Real short clip (needs web-weights/model + gallery embeds)
+# 3. Real short clip — DONE as far as it goes: 778 s of denoise, then a
+#    buffer-copy panic, no clip. Re-run AFTER the copy + sparse fixes,
+#    with RUST_BACKTRACE=1 if it fails again.
 ./target/release/lightx2v generate --model-dir web-weights/model \
   --embeds web-weights/gallery/<prompt>.safetensors --frames 81 --out clip
 #    expect: denoise + decode split printed; compare decode against the
@@ -594,3 +739,23 @@ changes: `cargo test --workspace --offline` 39 passed, 0 failed;
 `cargo fmt --check` clean. Not pushed — local commit-ready state
 only. The `clip1005*.latent` / `.rgb` outputs are gitignored, not
 committed.
+
+## Code changes in the Vast.ai session (2026-11-13)
+
+- `scripts/vast-bench-job.sh` (new): the onstart job script that
+  ran on the Vast.ai instance — apt + rustup (3 retries,
+  `--profile minimal`) + `cargo build --release` (2 retries) +
+  public-R2 downloads (byte-count verified, curl `--retry 3`) +
+  check / bench / generate sequence + results HTTP server on 8080
+  + JSON summary to stdout. No Rust code changed in this session.
+- `docs/benchmarks.md`: the Vast.ai section above; "What is NOT
+  measured" and the GPU checklist updated (items 1–3 done, with
+  the two wgpu bugs as the next blockers).
+- `~/workspace/custom-connectors/custom.vast-ai/CONNECTOR.md`:
+  create / poll / destroy / logs-API calls corrected to their
+  verified shapes (see that file).
+
+Verification after these changes: `cargo test --workspace --offline`
+39 passed, 0 failed; `cargo clippy --workspace --offline -- -D
+warnings` clean; `cargo fmt --check` clean. Not pushed — local
+commit only.
