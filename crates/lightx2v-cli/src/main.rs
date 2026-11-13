@@ -253,6 +253,15 @@ fn generation_for(frames: usize) -> Result<GenerationConfig, String> {
     }
 }
 
+/// Print the backend's per-op profile when `LIGHTX2V_PROFILE=1` is set
+/// (the CPU backend records one; other backends return `None` unless they
+/// implement `Backend::profile_report`).
+fn print_profile<B: Backend>(be: &B) {
+    if let Some(report) = be.profile_report() {
+        println!("{report}");
+    }
+}
+
 fn run_check<B: Backend>(be: &B) {
     println!("backend: {}", be.name());
     let results = check::run_all_on(be);
@@ -273,6 +282,7 @@ fn run_check<B: Backend>(be: &B) {
         results.len() - failed,
         failed
     );
+    print_profile(be);
     if failed > 0 {
         std::process::exit(1);
     }
@@ -328,6 +338,7 @@ fn run_bench<B: Backend>(be: &B, layers: usize) {
             std::process::exit(1);
         }
     }
+    print_profile(be);
 }
 
 fn run_generate_real<B: Backend>(
@@ -457,13 +468,16 @@ fn run_generate_real<B: Backend>(
                 timings.denoise_s(),
                 path.display()
             );
-            match pipe.decode(
+            let dt0 = Instant::now();
+            let decoded = pipe.decode(
                 be,
                 &latent,
                 gen.latent_frames,
                 geometry.height,
                 geometry.width,
-            ) {
+            );
+            let decode_s = dt0.elapsed().as_secs_f64();
+            match decoded {
                 Ok(video) => {
                     let vpath = out.with_extension("rgb");
                     if let Err(e) = std::fs::write(&vpath, &video.rgb) {
@@ -471,11 +485,12 @@ fn run_generate_real<B: Backend>(
                         std::process::exit(1);
                     }
                     println!(
-                        "real video: {} frames, {}x{}, {} bytes -> {}",
+                        "real video: {} frames, {}x{}, {} bytes, decode {:.3} s -> {}",
                         video.frames,
                         video.width,
                         video.height,
                         video.rgb.len(),
+                        decode_s,
                         vpath.display()
                     );
                 }
@@ -484,6 +499,7 @@ fn run_generate_real<B: Backend>(
                     std::process::exit(1);
                 }
             }
+            print_profile(be);
         }
         Err(e) => {
             eprintln!("error: generate failed: {e}");
@@ -541,7 +557,10 @@ fn run_generate_synthetic<B: Backend>(be: &B, seed: u64, out: &Path) {
                 timings.denoise_s(),
                 path.display()
             );
-            match pipe.decode(be, &latent, toy_gen.latent_frames, 64, 64) {
+            let dt0 = Instant::now();
+            let decoded = pipe.decode(be, &latent, toy_gen.latent_frames, 64, 64);
+            let decode_s = dt0.elapsed().as_secs_f64();
+            match decoded {
                 Ok(video) => {
                     let vpath = out.with_extension("rgb");
                     if let Err(e) = std::fs::write(&vpath, &video.rgb) {
@@ -549,11 +568,12 @@ fn run_generate_synthetic<B: Backend>(be: &B, seed: u64, out: &Path) {
                         std::process::exit(1);
                     }
                     println!(
-                        "synthetic video: {} frames, {}x{}, {} bytes -> {}",
+                        "synthetic video: {} frames, {}x{}, {} bytes, decode {:.3} s -> {}",
                         video.frames,
                         video.width,
                         video.height,
                         video.rgb.len(),
+                        decode_s,
                         vpath.display()
                     );
                 }
@@ -562,6 +582,7 @@ fn run_generate_synthetic<B: Backend>(be: &B, seed: u64, out: &Path) {
                     std::process::exit(1);
                 }
             }
+            print_profile(be);
         }
         Err(e) => {
             eprintln!("error: generate failed: {e}");

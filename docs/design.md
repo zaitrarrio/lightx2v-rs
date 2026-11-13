@@ -461,8 +461,20 @@ The chain, mirroring fastwan-rs exactly:
    ```sh
    # R2 bucket `lightx2v-weights`, public dev URL
    # https://pub-<id>.r2.dev/v1 — replace with the real one.
-   # CORS on the bucket must allow GET + Range from any origin
-   # (the page fetches cross-origin; R2 public URLs serve ACAO: *).
+   # CORS on the bucket must be set explicitly — a public r2.dev URL
+   # serves NO Access-Control-Allow-Origin by default (proven 2026-11-13:
+   # the page reported "Cannot reach the weights" until the policy below
+   # was set; the GET then returned ACAO: * and the Range preflight 204).
+   #   wrangler r2 bucket cors set lightx2v-weights --file cors.json
+   # cors.json (wrangler shape):
+   # {"rules": [{"allowed": {"origins": ["*"], "methods": ["GET", "HEAD"],
+   #   "headers": ["Range"]}, "exposeHeaders": ["Content-Length",
+   #   "Content-Range", "Accept-Ranges", "ETag"], "maxAgeSeconds": 86400}]}
+   # NOTE: `wrangler r2 object put` refuses files >300 MiB (f4 837 MB,
+   # f16 2.98 GB) — those need S3 multipart upload (boto3 with an R2 API
+   # token; the stored Cloudflare credential cannot create one, 403).
+   # And `wrangler r2 bucket cors set` needs the Cloudflare credential,
+   # not the object-scoped R2 token (PutBucketCors → AccessDenied).
    wrangler r2 object put lightx2v-weights/v1/lightx2v-1.3b-f4.safetensors \
      --file web-weights/lightx2v-1.3b-f4.safetensors --remote
    wrangler r2 object put lightx2v-weights/v1/lightx2v-1.3b-f16.safetensors \
@@ -537,6 +549,21 @@ serve gallery also accepts trimmed `[tokens, 4096]` files.
   missing job 404. The real `--model-dir` error path is verified too:
   an empty dir fails the engine at startup and `/api/health` reports
   `ready: false` with the weights error.
+- **Verified, page vs live (2026-11-13, user's screenshot):** the live
+  page showed two false errors at once. (1) "Cannot reach the weights":
+  a public r2.dev URL serves NO CORS headers by default — the GET had
+  no `Access-Control-Allow-Origin` and the Range preflight was 403 —
+  fixed by `wrangler r2 bucket cors set` (GET + HEAD, `Range` header,
+  ACAO `*`); after a few seconds' propagation the preflight returned
+  204 and Range GETs 206. (2) "server not reachable at 127.0.0.1:7860":
+  the page probed the local server on load even in browser mode — the
+  init now only probes when server mode is selected, and browser mode
+  sets a neutral engine line. The gallery is now checked BEFORE the
+  ~900 MB download (in `showBrowserInfo`) and is optional at load
+  (`bwLoad` warns instead of throwing after the download), so a
+  missing `gallery.json` reads as "embeddings aren't uploaded yet",
+  not as broken weights. Live verification of the fixed page is still
+  owed (parent re-deploys + re-checks the live URL).
 - **Verified, export (CPU, tiny):** `export::quantize_dit` on
   `WanConfig::tiny()` — stored codes equal load-time quantization
   per linear, and the written file re-reads block-ordered

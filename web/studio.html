@@ -405,6 +405,9 @@ async function showBrowserInfo() {
     return;
   }
   els.go.disabled = true;
+  // Browser mode has no server: say so on the engine line, clearing any
+  // stale server error from an earlier probe.
+  setEngine("wait", "Browser mode — load the model below to generate in this tab.");
   if (!CAN_BROWSER) {
     bwStatus("bad", "This browser has no WebGPU. Use a recent Chrome or Edge (or Safari 26+).");
     els.bwLoad.disabled = true; return;
@@ -426,7 +429,22 @@ async function showBrowserInfo() {
     const pref = store("lightx2v.variant");
     if (pref && bw.manifest.variants[pref]) els.bwVariant.value = pref;
   }
-  bwStatus("wait", "Load the model to run it in this browser.");
+  // Gallery embeds are the last missing piece for real prompts: check them
+  // now, before any ~900 MB download, so the page can say so plainly.
+  if (!bw.entries.length) {
+    try {
+      const g = await (await fetch(`${WEIGHTS}/${bw.manifest.gallery}`, { cache: "no-store" })).json();
+      bw.entries = g.prompts;
+      bw.galleryBase = `${WEIGHTS}/${bw.manifest.gallery}`;
+      bw.galleryBase = bw.galleryBase.slice(0, bw.galleryBase.lastIndexOf("/") + 1);
+      fillExamples(bw.entries.map((e) => e.prompt), true);
+      bwStatus("wait", "Load the model to run it in this browser.");
+    } catch {
+      bwStatus("wait", "Load the model to run it in this browser — the gallery prompt embeddings aren't uploaded yet, so real generation can't run until they are.");
+    }
+  } else {
+    bwStatus("wait", "Load the model to run it in this browser.");
+  }
 }
 
 // Cache: whole groups, keyed by file, size and group, so a re-uploaded file
@@ -539,13 +557,23 @@ async function bwLoad() {
   bwStatus("wait", "Loading the decoder…");
   const tb = await load(`${taeUrl}?size=${bw.manifest.tae.bytes}`, bw.manifest.tae.bytes, (on) => fetchBytes(taeUrl, null, on));
   bw.eng.loadTae(tb);
+  // The gallery is optional at load time: the weights are the download, and
+  // a missing gallery.json must not throw away a loaded model.
   const gurl = `${WEIGHTS}/${bw.manifest.gallery}`;
-  bw.entries = (await (await fetch(gurl, { cache: "no-store" })).json()).prompts;
-  bw.galleryBase = gurl.slice(0, gurl.lastIndexOf("/") + 1);
+  try {
+    bw.entries = (await (await fetch(gurl, { cache: "no-store" })).json()).prompts;
+    bw.galleryBase = gurl.slice(0, gurl.lastIndexOf("/") + 1);
+  } catch {
+    bw.entries = [];
+    console.warn("lightx2v: gallery.json not available — real prompts need the embeddings upload");
+  }
   bw.loaded = `${bw.manifest.name || "LightX2V Wan2.1-T2V-1.3B"} · ${v.label} · in this browser`;
   console.info("lightx2v: WebGPU", bw.eng.adapter(), "|", bw.eng.limits());
   els.bwLoad.disabled = false; els.bwLoad.textContent = "Reload";
   bwStatus("ok", `Model ready in ${((performance.now() - t0) / 1000).toFixed(1)} s.`);
+  if (!bw.entries.length) {
+    bwStatus("wait", "Model ready — but the gallery prompt embeddings aren't uploaded yet, so no real prompt can run until they are.");
+  }
   showBrowserInfo();
   if (els.size.querySelector('option[value="480x272"]')) els.size.value = "480x272";
 }
@@ -712,9 +740,11 @@ els.bwLoad.onclick = () => {
 };
 
 // Same-origin server mode by default; fall back to the examples list until
-// the first health check answers.
+// the first health check answers. Only probe the local server when server
+// mode is selected — browser mode has no server to reach, and probing it
+// on load paints a false "server not reachable" error.
 fillExamples(GALLERY_PROMPTS, false);
-refreshServerHealth();
+if (els.modes.value === "browser") showBrowserInfo(); else refreshServerHealth();
 </script>
 </body>
 </html>

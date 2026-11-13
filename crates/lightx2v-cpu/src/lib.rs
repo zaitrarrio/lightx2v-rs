@@ -20,6 +20,90 @@ use lightx2v_core::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// Per-op profiling, enabled by `LIGHTX2V_PROFILE=1` (any value but `0`).
+/// Off by default: zero overhead beyond one `OnceLock` load per op call.
+/// Times are inclusive: `residual_norm` calls `layer_norm`, so the
+/// `layer_norm` row is counted inside the `residual_norm` row too.
+fn profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LIGHTX2V_PROFILE").is_some_and(|v| v != "0"))
+}
+
+static PROFILE: LazyLock<Mutex<HashMap<&'static str, (u64, Duration)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// RAII per-op timer; records (calls, total time) on drop when enabled.
+struct ProfileTimer {
+    name: &'static str,
+    start: Instant,
+}
+
+impl ProfileTimer {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ProfileTimer {
+    fn drop(&mut self) {
+        if !profile_enabled() {
+            return;
+        }
+        let dt = self.start.elapsed();
+        let mut m = PROFILE.lock().unwrap();
+        let e = m.entry(self.name).or_insert((0, Duration::ZERO));
+        e.0 += 1;
+        e.1 += dt;
+    }
+}
+
+fn profile_report_string() -> Option<String> {
+    if !profile_enabled() {
+        return None;
+    }
+    let m = PROFILE.lock().unwrap();
+    if m.is_empty() {
+        return None;
+    }
+    let total: Duration = m.values().map(|(_, d)| *d).sum();
+    let mut rows: Vec<(&'static str, (u64, Duration))> = m.iter().map(|(k, v)| (*k, *v)).collect();
+    rows.sort_by_key(|a| std::cmp::Reverse(a.1 .1));
+    let mut s = String::from(
+        "cpu profile (LIGHTX2V_PROFILE=1; times inclusive, see residual_norm note):
+",
+    );
+    s.push_str(
+        "op                  calls      total_ms   mean_us   share
+",
+    );
+    for (name, (calls, d)) in rows {
+        let ms = d.as_secs_f64() * 1e3;
+        let mean_us = d.as_secs_f64() * 1e6 / calls as f64;
+        let share = if total.is_zero() {
+            0.0
+        } else {
+            d.as_secs_f64() / total.as_secs_f64() * 100.0
+        };
+        s.push_str(&format!(
+            "{name:<18} {calls:>8} {ms:>12.3} {mean_us:>9.1} {share:>6.1}%
+"
+        ));
+    }
+    s.push_str(&format!(
+        "profile total: {:.3} ms (note: residual_norm includes its layer_norm call)
+",
+        total.as_secs_f64() * 1e3
+    ));
+    Some(s)
+}
+
 #[derive(Debug, Clone)]
 pub struct Buf(pub Rc<RefCell<Vec<f32>>>);
 
@@ -134,10 +218,12 @@ impl Backend for CpuBackend {
     }
 
     fn alloc(&self, len: usize) -> Buf {
+        let _pt = ProfileTimer::new("alloc");
         Buf(Rc::new(RefCell::new(vec![0.0; len])))
     }
 
     fn upload(&self, data: &[f32]) -> Buf {
+        let _pt = ProfileTimer::new("upload");
         Buf(Rc::new(RefCell::new(data.to_vec())))
     }
 
@@ -146,6 +232,7 @@ impl Backend for CpuBackend {
     }
 
     fn download(&self, buf: &Buf) -> Vec<f32> {
+        let _pt = ProfileTimer::new("download");
         buf.get().clone()
     }
 
@@ -154,11 +241,13 @@ impl Backend for CpuBackend {
     }
 
     fn copy(&self, src: &Buf, src_off: usize, dst: &Buf, dst_off: usize, len: usize) {
+        let _pt = ProfileTimer::new("copy");
         let tmp: Vec<f32> = src.get()[src_off..src_off + len].to_vec();
         dst.get_mut()[dst_off..dst_off + len].copy_from_slice(&tmp);
     }
 
     fn weight(&self, data: &[f32], rows: usize, cols: usize) -> Weight {
+        let _pt = ProfileTimer::new("weight");
         assert_eq!(data.len(), rows * cols);
         Weight {
             data: Rc::new(data.to_vec()),
@@ -196,6 +285,14 @@ impl Backend for CpuBackend {
 
     fn sync(&self) {}
 
+    fn profile_report(&self) -> Option<String> {
+        profile_report_string()
+    }
+
+    fn profile_reset(&self) {
+        PROFILE.lock().unwrap().clear();
+    }
+
     fn linear(
         &self,
         x: &Buf,
@@ -208,6 +305,7 @@ impl Backend for CpuBackend {
         y_row: usize,
     ) {
         let x = x.get();
+        let _pt = ProfileTimer::new("linear");
         let mut y = y.get_mut();
         let bias = bias.map(|b| b.get());
         for r in 0..rows {
@@ -238,6 +336,7 @@ impl Backend for CpuBackend {
         out: &Buf,
     ) {
         let x = x.get();
+        let _pt = ProfileTimer::new("layer_norm");
         let mods = mods.get();
         let mut out = out.get_mut();
         let affine = match &norm {
@@ -274,6 +373,7 @@ impl Backend for CpuBackend {
         eps: f32,
         normed: &Buf,
     ) {
+        let _pt = ProfileTimer::new("residual_norm");
         {
             let mut h = h.get_mut();
             let a = a.get();
@@ -292,6 +392,7 @@ impl Backend for CpuBackend {
     }
 
     fn gate_residual(&self, h: &Buf, a: &Buf, rows: usize, dim: usize, mods: &Buf, gate: usize) {
+        let _pt = ProfileTimer::new("gate_residual");
         let mut h = h.get_mut();
         let a = a.get();
         let mods = mods.get();
@@ -316,6 +417,7 @@ impl Backend for CpuBackend {
         out: &Buf,
     ) {
         let src = src.get();
+        let _pt = ProfileTimer::new("head_split");
         let mut out = out.get_mut();
         let rms_w = rms_w.map(|b| b.get());
         let rope = rope.map(|(c, s)| (c.get(), s.get()));
@@ -364,6 +466,7 @@ impl Backend for CpuBackend {
         head_dim: usize,
         out: &Buf,
     ) {
+        let _pt = ProfileTimer::new("attention");
         let (q, k, v) = (q.get(), k.get(), v.get());
         let mut out = out.get_mut();
         attention_impl(&q, &k, &v, heads, sq, sk, head_dim, None, &mut out);
@@ -381,6 +484,7 @@ impl Backend for CpuBackend {
         mask: Option<&[bool]>,
         out: &Buf,
     ) {
+        let _pt = ProfileTimer::new("causal_attention");
         let (q, k, v) = (q.get(), k.get(), v.get());
         let mut out = out.get_mut();
         attention_impl(&q, &k, &v, heads, sq, sk, head_dim, mask, &mut out);
@@ -400,6 +504,7 @@ impl Backend for CpuBackend {
         out: &Buf,
     ) {
         // The CPU reference is the full VSA algorithm (see crate::sparse):
+        let _pt = ProfileTimer::new("sparse_attention");
         // coarse mean-pool attention over tiles, top-k tile selection by the
         // coarse scores, fine attention to the selected tiles only, and the
         // combine `out = coarse \u00b7 gate + fine`. A GPU kernel must match
@@ -497,6 +602,7 @@ impl Backend for CpuBackend {
     }
 
     fn kv_cache_new(&self, heads: usize, head_dim: usize, capacity_tokens: usize) -> KvCache {
+        let _pt = ProfileTimer::new("kv_cache_new");
         KvCache {
             heads,
             head_dim,
@@ -517,6 +623,7 @@ impl Backend for CpuBackend {
         temporal: &[usize],
     ) {
         debug_assert_eq!(temporal.len(), rows);
+        let _pt = ProfileTimer::new("kv_cache_append");
         let (k, v) = (k.get(), v.get());
         let d = cache.heads * cache.head_dim;
         for (r, &t) in temporal.iter().enumerate().take(rows) {
@@ -536,6 +643,7 @@ impl Backend for CpuBackend {
 
     fn kv_cache_put(&self, cache: &mut KvCache, k: &Buf, v: &Buf, rows: usize, temporal: &[usize]) {
         debug_assert_eq!(temporal.len(), rows);
+        let _pt = ProfileTimer::new("kv_cache_put");
         // Overwrite in place when these temporal indices are already cached
         // (the same chunk re-run on the next DMD step).
         // Skip the EMA slots: they share the first non-sink frame's
@@ -567,6 +675,7 @@ impl Backend for CpuBackend {
     }
 
     fn kv_cache_len(&self, cache: &KvCache) -> usize {
+        let _pt = ProfileTimer::new("kv_cache_len");
         cache.rows()
     }
 
@@ -575,6 +684,7 @@ impl Backend for CpuBackend {
     }
 
     fn kv_cache_kv(&self, cache: &KvCache) -> (Buf, Buf) {
+        let _pt = ProfileTimer::new("kv_cache_kv");
         let rows = cache.rows();
         let d = cache.head_dim;
         let mut k = vec![0.0f32; cache.heads * rows * d];
@@ -597,6 +707,7 @@ impl Backend for CpuBackend {
         cfg: &MemRopeConfig,
         frame_tokens: usize,
     ) {
+        let _pt = ProfileTimer::new("kv_cache_memrope_update");
         let d = cache.heads * cache.head_dim;
         let frame_rows = |cache: &KvCache| cache.rows() / frame_tokens;
         // Classify rows into frames (frame_tokens consecutive rows each).
@@ -692,6 +803,7 @@ impl Backend for CpuBackend {
     }
 
     fn patchify(&self, latent: &Buf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &Buf) {
+        let _pt = ProfileTimer::new("patchify");
         let latent = latent.get();
         let mut out = out.get_mut();
         // latent [c, t, h, w]; token (tt, hh, ww) -> [tt*(h/p)*(w/p) + hh*(w/p) + ww],
@@ -714,6 +826,7 @@ impl Backend for CpuBackend {
     }
 
     fn unpatchify(&self, x: &Buf, c: usize, t: usize, h: usize, w: usize, p: usize, out: &Buf) {
+        let _pt = ProfileTimer::new("unpatchify");
         let x = x.get();
         let mut out = out.get_mut();
         // Token feature cc*p² + kh*p + kw (channel-major, the
@@ -745,6 +858,7 @@ impl Backend for CpuBackend {
         n: usize,
     ) {
         let mut x = x.get_mut();
+        let _pt = ProfileTimer::new("dmd_step");
         let v = v.get();
         let noise = noise.map(|b| b.get());
         for i in 0..n {
@@ -767,6 +881,7 @@ impl Backend for CpuBackend {
         out: &Buf,
     ) {
         let (a, b) = (a.get(), b.map(|x| x.get()));
+        let _pt = ProfileTimer::new("conv2d");
         let mut out = out.get_mut();
         let bias = bias.map(|x| x.get());
         let (oh, ow) = shape.out_hw();
@@ -852,6 +967,7 @@ impl Backend for CpuBackend {
     }
 
     fn tanh_clamp(&self, x: &Buf, n: usize, s: f32) {
+        let _pt = ProfileTimer::new("tanh_clamp");
         let mut x = x.get_mut();
         for v in x.iter_mut().take(n) {
             *v = (*v / s).tanh() * s;
