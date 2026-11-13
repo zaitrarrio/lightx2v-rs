@@ -33,6 +33,24 @@ RunPod GraphQL API: `POST https://api.runpod.io/graphql`,
 `Authorization: Bearer <RUNPOD_API_KEY>`. Create with the
 `podFindAndDeployOnDemand` mutation (docs: https://docs.runpod.io/sdks/graphql/manage-pods).
 
+**2026-11-13 field report (6 deploys, all stalled except 1):** the
+runbook's image tag `runpod/pytorch:2.9.0-cu1300-ubuntu2404` does NOT
+exist — current tags are `runpod/pytorch:2.2.0-rc.229-cu*-torch*-ubuntu2404`
+(all RC; old stable tags were removed from the registry). Only 1 of 6
+pods ever reported a `runtime` (secure RTX 4090, ~4 min); the rest sat
+with `machineId` + `lastStartedAt` set but `runtime: null` for 10–26
+min across images (pytorch RC, ubuntu:22.04, nvidia/cuda:12.8.1-runtime),
+clouds (community + secure), GPU types (A4000, 4090) and inputs
+(with/without `volumeInGb`, with/without `ports: "22"`). A pod
+deployed the same way by another agent (`nvidia/cuda:12.8.1-runtime-ubuntu24.04`,
+RTX 5090) started in ~3 min — it is a host lottery. **SSH from this
+VM is blocked at the egress proxy** (`CONNECT ssh.runpod.io:22` hangs;
+`api.runpod.io:443` works), so even a running pod is unreachable from
+here until `ssh.runpod.io` is allowlisted. Also: deploy with env
+`SSH_PUBLIC_KEY=<this VM's public key>` so the VM key is authorized
+(the account's registered key is unknown). Total spend for the 6
+stalled attempts was ~$1.50, almost all of it idle waiting time.
+
 - Prefer a CPU pod with >= 24 GB RAM (`cpuTypes` query) if cheaper than GPU.
 - Else the cheapest GPU pod with >= 24 GB RAM: community-cloud RTX A5000
   (~$0.27/hr) / L4 (~$0.39/hr) / RTX 4090 (~$0.34/hr) — check live
