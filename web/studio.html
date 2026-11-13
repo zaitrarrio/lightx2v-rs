@@ -389,7 +389,7 @@ async function runOnServer() {
     } catch (e) {
       clearInterval(pollTimer);
       setEngine("bad", `job failed: ${e.message}`);
-      setSummary(`Job failed: ${e.message}`);
+      setSummary(`Job failed: ${e.message || e}`);
     }
   }, 500);
 }
@@ -711,8 +711,11 @@ els.go.onclick = async () => {
       await runOnServer();
     }
   } catch (e) {
-    setEngine("bad", e.message);
-    setSummary(`Failed: ${e.message}`);
+    // The wasm engine rejects with a real Error now, but stay robust to a
+    // plain-string rejection too — `e.message` alone printed "Failed:
+    // undefined" and hid the real reason (2026-11-13).
+    setEngine("bad", e.message || String(e));
+    setSummary(`Failed: ${e.message || e}`);
   } finally {
     els.go.disabled = false;
   }

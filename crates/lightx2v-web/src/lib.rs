@@ -60,7 +60,11 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 fn err(e: impl std::fmt::Display) -> JsValue {
-    JsValue::from_str(&e.to_string())
+    // A real JS Error, not a plain string: the page reads `e.message`,
+    // and a rejected promise carrying a string has no `.message` — the
+    // page then shows "Failed: undefined" and the real reason is lost
+    // (seen 2026-11-13 on the first real browser generation attempt).
+    js_sys::Error::new(&e.to_string()).into()
 }
 
 fn now_ms() -> f64 {
