@@ -1,0 +1,13 @@
+[package]
+name = "lightx2v-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+half = "2.7.1"
+memmap2 = "0.9.12"
+safetensors = "0.7.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"

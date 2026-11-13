@@ -1,0 +1,13 @@
+[package]
+name = "lightx2v-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lightx2v-core = { version = "0.1.0", path = "../lightx2v-core" }
+lightx2v-cpu = { version = "0.1.0", path = "../lightx2v-cpu" }
+
+[dev-dependencies]
+half = "2.7.1"
+safetensors = "0.7.0"

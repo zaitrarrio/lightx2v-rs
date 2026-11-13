@@ -1,0 +1,9 @@
+/target/
+research/
+*.safetensors
+*.latent
+models/
+*.bin
+*.pt
+*.pth
+.DS_Store
