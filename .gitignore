@@ -10,3 +10,5 @@ models/
 web-weights/
 web/pkg/
 web/dist/
+
+.wrangler/

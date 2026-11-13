@@ -422,11 +422,14 @@ impl Backend for CpuBackend {
         let rms_w = rms_w.map(|b| b.get());
         let rope = rope.map(|(c, s)| (c.get(), s.get()));
         let d = heads * head_dim;
+        // One scratch row, reused for every token: the old code allocated
+        // a fresh `vec![0.0; d]` per row (3 calls x rows x layers x steps
+        // = millions of 6 KiB mallocs at real scale).
+        let mut tmp = vec![0.0f32; d];
         for r in 0..rows {
             let row = &src[r * src_stride + col_off..r * src_stride + col_off + d];
             // RMS norm across all heads, then per-head weight — but only
             // when a weight is given: v passes through unnormalised.
-            let mut tmp = vec![0.0f32; d];
             if let Some(w) = &rms_w {
                 let ms = row.iter().map(|v| v * v).sum::<f32>() / d as f32;
                 let inv = 1.0 / (ms + eps).sqrt();
