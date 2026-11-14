@@ -71,6 +71,14 @@ status binaries "prebuilt binaries verified"
 # the path baked in at build time:
 #   /home/hatch/workspace/lightx2v-rs/scripts/reference/make_fixture.py
 # Recreate exactly that path on the host and fetch the (stdlib-only) script.
+# ALSO create the baked-in manifest dir itself
+# (/home/hatch/workspace/lightx2v-rs/crates/lightx2v-wgpu): the test
+# builds the script path as CARGO_MANIFEST_DIR + "/../../scripts/...",
+# and the kernel cannot resolve the `..` components unless the
+# crates/lightx2v-wgpu directory EXISTS — without it, python3 fails
+# with ENOENT even though the script file is in place (seen on run 3,
+# instance 60660688: two fixture tests failed, then the binary hung).
+mkdir -p /home/hatch/workspace/lightx2v-rs/crates/lightx2v-wgpu
 mkdir -p /home/hatch/workspace/lightx2v-rs/scripts/reference
 curl -sSfL --retry 3 --retry-delay 5 \
   -o /home/hatch/workspace/lightx2v-rs/scripts/reference/make_fixture.py \
@@ -128,10 +136,13 @@ run check-wgpu $BIN check --backend wgpu
 # Full wgpu conformance on GPU (3 tests): checks + tiny-DiT rollout vs the
 # CPU oracle + TAEHV decode vs the CPU oracle. The rollout exercises the
 # whole KV-cache path (put / memrope update / kv) at tiny scale.
-run wgpu-conformance /root/bin/conformance-wgpu
+# --test-threads=1: the three tests each create a WgpuBackend; creating
+# them concurrently hung the binary on run 3 (no output for 9+ min, GPU
+# idle). timeout 600: a hang must not block bench/generate.
+run wgpu-conformance timeout 600 /root/bin/conformance-wgpu --test-threads=1
 run bench-wgpu $BIN bench --backend wgpu --layers 30
 run bench-cpu $BIN bench --backend cpu --layers 30
-run generate-wgpu-81 $BIN generate --model-dir /root/model --embeds /root/model/fox.safetensors \
+run generate-wgpu-81 timeout 1500 $BIN generate --model-dir /root/model --embeds /root/model/fox.safetensors \
   --backend wgpu --frames 81 --out "$RESULTS/clip-real-wgpu"
 
 # 60 s rollout only if the 81-frame GPU run succeeded and was quick (<5 min).
@@ -148,7 +159,7 @@ for m in re.finditer(r'WALL=([0-9.]+) MAXRSS_MiB=[0-9.]+ EXIT=0 CMD=(.+generate.
   WGPU81_WALL=${WGPU81_WALL:-0}
 fi
 if [ "$WGPU81_OK" = 1 ] && python3 -c "exit(0 if float('${WGPU81_WALL:-0}') < 300 else 1)"; then
-  run generate-wgpu-1005 $BIN generate --model-dir /root/model --embeds /root/model/fox.safetensors \
+  run generate-wgpu-1005 timeout 1500 $BIN generate --model-dir /root/model --embeds /root/model/fox.safetensors \
     --backend wgpu --frames 1005 --out "$RESULTS/clip-real-wgpu-60s"
 else
   echo "SKIP generate-wgpu-1005 (81-frame ok=$WGPU81_OK wall=$WGPU81_WALL)" | tee -a "$RESULTS/timings.txt"
