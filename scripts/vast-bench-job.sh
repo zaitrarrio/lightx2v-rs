@@ -31,16 +31,19 @@ apt-get install -y -qq curl git build-essential pkg-config libvulkan1 vulkan-too
 
 # ---- Rust ----------------------------------------------------------------
 # Retry: the host's egress to static.rust-lang.org can drop mid-download.
+# Run 1 died here after 3 attempts, so: 5 attempts, curl-level retries,
+# bounded per-attempt time, and growing backoff. Fail fast with a clear
+# stage error if it still fails (do not burn the run on a hopeless host).
 if ! command -v cargo >/dev/null 2>&1; then
   RUSTUP_OK=0
-  for i in 1 2 3; do
+  for i in 1 2 3 4 5; do
     echo "rustup attempt $i"
-    if curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; then
+    if curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 10 --retry-all-errors --max-time 120 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable; then
       RUSTUP_OK=1; break
     fi
-    sleep 10
+    sleep $((10 * i))
   done
-  [ "$RUSTUP_OK" = 1 ] || fail rustup "rustup install failed after 3 attempts"
+  [ "$RUSTUP_OK" = 1 ] || fail rustup "rustup install failed after 5 attempts"
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo --version || fail rustup "cargo not on PATH after install"
@@ -109,10 +112,17 @@ run() { # run <tag> <cmd...>: time it, append to timings.txt, never abort the sc
 }
 
 # ---- benchmark sequence ----------------------------------------------------
+# RUST_BACKTRACE=1: if generate panics again, the backtrace names the exact
+# copy call site (the 2026-11-13 panic had none).
+export RUST_BACKTRACE=1
 # NOTE: a full real-scale CPU generate is NOT run: the analytic projection
 # (~170 h denoise per 81-frame clip, docs/benchmarks.md) makes it infeasible.
 # CPU comparison is the tiny synthetic bench only.
 run check-wgpu $BIN check --backend wgpu
+# Full wgpu conformance on GPU: the tiny-DiT rollout vs the CPU oracle
+# exercises the whole KV-cache path (put / memrope update / kv) at tiny
+# scale — the cache fixes are verified here before the real generate.
+run wgpu-conformance cargo test --release --test conformance wgpu_
 run bench-wgpu $BIN bench --backend wgpu --layers 30
 run bench-cpu $BIN bench --backend cpu --layers 30
 run generate-wgpu-81 $BIN generate --model-dir /root/model --embeds /root/model/fox.safetensors \

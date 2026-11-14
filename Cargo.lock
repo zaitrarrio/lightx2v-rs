@@ -469,6 +469,7 @@ dependencies = [
  "lightx2v-core",
  "lightx2v-cpu",
  "lightx2v-model",
+ "naga",
  "pollster",
  "wasm-bindgen",
  "wasm-bindgen-futures",

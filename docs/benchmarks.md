@@ -357,6 +357,170 @@ $0.29; the three failed ones ≈ $0.06 combined). The V100 offer
 vanished from the bundles between attempts 1 and 4 — offers churn,
 so re-check live before creating.
 
+#### Fix verification run 1 — failed before any benchmark (rustup downloads timed out)
+
+2026-11-13 ~23:14–00:39 UTC. Fix commit `8a2a419` (local only, NOT
+pushed; VSA sparse + KV-cache copy-panic fixes, on top of `6672108`)
+was verified on **instance 60560018, Tesla V100 32 GB, offer
+47966236, $0.0672/hr**, image `vastai/pytorch:cuda-12.8.1-auto`.
+The onstart wrapper cloned main (`b3bde63`) and applied the fix as
+a gzip+base64 patch — `PATCH_OK`, clean apply — then ran the
+(patched) `scripts/vast-bench-job.sh`.
+
+**Result: the job never reached a benchmark.** The rustup install
+failed after all 3 retries — every attempt timed out downloading
+from `static.rust-lang.org` (attempt 1: the rustup-init downloader
+timed out; attempts 2–3: the rustc 1.100.0 component download
+timed out mid-body). The script's `fail()` wrote
+`{"status":"error","stage":"rustup","msg":"rustup install failed after 3 attempts"}`
+and exited 0; the container then sat idle (`gpu_util` 0.0,
+`cpu_util` 0.0) until the instance was destroyed. No
+`check`/`wgpu-conformance`/`bench`/`generate` output exists, so
+**the fix itself is neither verified nor refuted** — run 1 of the
+2-run cap is consumed with no signal on the two bugs.
+
+This is the second rustup-download failure on Vast.ai (attempt 3
+above died the same way); the 3× retry hardening did not save this
+run. A future run should pre-bake the Rust toolchain into the
+image (or fetch it from a mirror) instead of relying on
+`static.rust-lang.org` from the instance at boot.
+
+Two operational notes from this run: the detached poller (pid
+1830) died at 23:18 UTC after a single 403 from the logs API and
+wrote nothing further — the log was retrieved by a manual poll at
+00:39 UTC (the 403 was transient; the same call then worked).
+Instance destroyed 00:39 UTC after retrieval, verified gone
+(`vast get` → `{"instances": null}`). Spend ≈ **$0.10** (~85 min ×
+$0.0672/hr). Run 2 was not started — per the run instructions,
+report and stop after a failed run 1.
+
+#### Fix verification run 2 — failed at boot (image pull never completed)
+
+2026-11-13 ~03:02–04:05 UTC. Last of the 2-run cap. Fix commit
+`8a2a419` + rustup-hardening commit `9b4156b` (both local only, NOT
+pushed; hardening: 5 rustup attempts, curl `--retry 5
+--retry-delay 10 --retry-all-errors --max-time 120`, growing
+backoff). **Instance 60584719, Tesla V100 32 GB, offer 58421593,
+host 381795** (run 1's host 381079 excluded), image
+`vastai/pytorch:cuda-12.8.1-auto`. Live rate $0.0806/hr (offer
+quoted $0.0689/hr). The fix patch was regenerated from local git
+(`6672108..9b4156b`, 18,378 B) and verified to apply cleanly to a
+fresh clone of remote main `b3bde63` before the create; the onstart
+wrapper (9,785 chars, under the 16 KB limit) was rebuilt with the
+new patch.
+
+**Result: the instance never booted.** The image pull on this fresh
+host crawled for 62 minutes and never completed — Docker layers
+cycled through retrying (`ae9716fa7429: Retrying`, then
+`d3d18d7f70db: Download complete`, `15643a6bfa16: Verifying
+Checksum`, `72fe3c11b185: Retrying`), each layer taking ~10 min,
+and at 04:01 UTC the pull was back to retrying the *first* layer.
+Status flapped `loading`/`offline` the whole time; `actual_status`
+never reached `running`. The container never started — the logs API
+returned `Error response from daemon: No such container:
+C.60584719` and no container log exists. The onstart wrapper (and
+therefore the patch, the hardened rustup, and every benchmark) never
+ran. **The fix is still neither verified nor refuted.**
+
+Instance destroyed 04:05 UTC after retrieval of the final status,
+verified gone (`vast get` → `{"instances": null}`); the detached
+poller (pid 7236) was stopped. Spend ≈ **$0.08** (~63 min ×
+$0.0806/hr). Combined run-1 + run-2 spend ≈ $0.18; combined with
+the first benchmark run ≈ $0.53 total across all Vast.ai work.
+
+Lesson for any future verification: both failed runs died on host
+egress, not on the code — run 1 on `static.rust-lang.org`, run 2 on
+the Docker registry. Pick a host with the image already cached
+(boot in ~5 min when cached, vs 60+ min and counting here) or use a
+smaller image; pre-baking the Rust toolchain into the image would
+remove the second failure mode as well. The two GPU bugs remain
+open with no new evidence either way.
+
+#### Fix verification, RunPod attempt — no pod ever got a runtime (7 pods, 0 runtimes)
+
+2026-11-14 ~04:08–05:30 UTC (2026-11-13 ~22:08–23:30 CST). User
+redirected here after both Vast.ai verification runs died on host
+egress. Same fix commit `8a2a419` (local only) + hardened rustup
+commit `9b4156b`. Job script `scripts/runpod-verify-job.sh`
+(9,188 B) and the fix patch (17,093 B, `git diff
+6672108..8a2a419`, 5 files) were pushed to remote main
+(`4def248a`, via the git-data API — blobs → tree with base_tree →
+commit → ref update; NOT `push-local`, which would have swept
+untracked `.vast-verify/` into the tree). The patch was verified to
+apply cleanly to a fresh clone of remote main `b3bde63` before any
+deploy. The job script (adapted from `scripts/vast-bench-job.sh`)
+starts an HTTP server on port 8080 serving `/root/results` first,
+then apt + hardened rustup, clones remote main, downloads and
+applies the patch, `cargo build --release`, downloads f4/TAEHV/fox
+embed from public R2 with byte-count checks, then `check --backend
+wgpu` (want 11/11), `cargo test --release --test conformance wgpu_`
+(want 3/3), `bench --backend wgpu/cpu --layers 30`, and `generate
+--backend wgpu --frames 81` with `RUST_BACKTRACE=1` (want a
+completed `clip-real-wgpu.rgb`/`.latent`), writing `summary.json`
++ `_done.json`/`_error.json` and sleeping 1800 s for retrieval.
+
+**Result: no pod ever got a runtime, so the job script never ran
+— not once.** `podFindAndDeployOnDemand` returned
+`desiredStatus: RUNNING` with a `machineId` and `lastStartedAt`
+set, but `runtime` stayed `null` for every pod, through waits of
+12–25 min each. All pods were terminated and verified gone
+(`runpod get` → `pod: null`); `runpod pods` shows no live pods.
+
+| # | pod | offer / image | outcome |
+|---|---|---|---|
+| 1 | `7ms4745abzoxl8` | secure RTX 4090 $0.89/hr, pytorch | no runtime in ~14 min, terminated |
+| 2 | `2nf30ai04owanb` | secure RTX 5090 ~$1.39/hr, pytorch | no runtime in ~14 min, terminated |
+| 3 | `ua44mchkt19tqf` | community RTX 3090 Ti $0.27/hr, pytorch | no runtime in ~25 min (extended wait — the image pull was suspected), terminated |
+| 4 | `or0fsgkcxhtwrm` | community RTX A5000 $0.16/hr, `nvidia/cuda:12.8.1-runtime-ubuntu24.04` | no runtime in ~12 min, terminated |
+| 5 | `nguaartyewevnk` | community RTX A4000 $0.17/hr, pytorch | no runtime in ~14 min, terminated |
+
+Two extra pods (`dv971lcy6xpaer` secure RTX 4000 Ada,
+`o9jh6i15oqsq6g` secure A40) were created by accident when three
+deploys were batched in one shell command and terminated within
+~1 min — never batch multiple deploys in one command; each one
+spends. Eleven further deploys failed instantly with
+`SUPPLY_CONSTRAINT` (no pod created, $0): community A5000, A4000
+(×2), A4500, V100-PCIE-16GB, 3090, 4080, 4090; secure A4000,
+A4500, A5000. Community cloud was dry; secure 4090/5090 created
+but stalled.
+
+Three hypotheses were tested and narrowed: (a) **image pull** —
+pod 3 got the longest wait (25 min) and pod 4 used the much
+smaller CUDA image, both still stalled, so a slow pull alone does
+not explain it; (b) **deploy input** — the gallery job (pod
+`7synm9ys15zuoo`, same `podFindAndDeployOnDemand` shape, same
+pytorch image, community A4000, runtime in ~3 min) proves the
+shape works, and the gallery agent's session record confirms it;
+(c) **platform outage** — RunPod status pages (all regions) showed
+up, no outages in 24 h. What remains is the host lottery: public
+write-ups match exactly — `desiredStatus: RUNNING` with no runtime
+means the host is alive while the inner container never reports
+(failed image pull, host disk full, or a bad host just freed by a
+prior tenant); the fix there is terminate and re-create, switching
+to SECURE after two failures. Tonight that did not help either:
+5 waited-out pods across both clouds, 0 runtimes. **The fix is
+still neither verified nor refuted — a third straight attempt
+died before the code could run.**
+
+**Retrieval channel — never tested.** No pod got a runtime, so
+the HTTP proxy URL (`https://<pod-id>-8080.proxy.runpod.net/`)
+was never exercised; SSH from this VM is blocked (same as
+Vast.ai) and a web search confirmed **pod logs are NOT available
+via the GraphQL or REST API** — so the HTTP proxy is the only
+retrieval channel for a no-SSH RunPod job, and it remains
+unproven. If a future pod gets a runtime, test the proxy URL
+early, before the long generate.
+
+Spend ≈ **$0.72** (4090 ~$0.21 + 5090 ~$0.32 + 3090 Ti ~$0.11 +
+A4000 ~$0.04 + A5000 ~$0.03 + the two 1-min pods ~$0.01), within
+the ~$2 cap. No second RunPod run was started — the attempt stops
+here for the parent's call. Combined across all three verification
+attempts (Vast.ai ×2 + RunPod): ≈ **$0.90** spent, zero benchmark
+signal, the two GPU bugs still open. The lesson from all three:
+pre-bake the toolchain + deps into the image (or use a host with
+the image cached) and keep trying cheap community offers — the
+failure mode is always the host, never the code so far.
+
 ### Serve generation
 
 Nothing new to measure here: the [Serve](#serve-lightx2v-serve---synthetic-release)

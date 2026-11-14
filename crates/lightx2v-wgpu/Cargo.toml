@@ -27,3 +27,6 @@ js-sys = "0.3.107"
 [dev-dependencies]
 lightx2v-cpu = { version = "0.1.0", path = "../lightx2v-cpu" }
 lightx2v-model = { version = "0.1.0", path = "../lightx2v-model" }
+# WGSL validation of the edited shaders without a GPU (naga is already in
+# the lockfile via wgpu, so this resolves offline).
+naga = "30.0.1"

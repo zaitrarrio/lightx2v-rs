@@ -110,12 +110,48 @@ enum Quant {
     Q4,
 }
 
+/// Host-side row geometry of one KV cache: `capacity` is the rows the
+/// device K/V buffers actually hold. Every resize of the device buffers
+/// goes through here, so `capacity` can never go stale the way it did in
+/// the 2026-11-13 Vast.ai panic — a compaction shrank the buffers to
+/// 9,362 rows while `capacity` still said 18,720, and a later grow
+/// copied 14,042 rows from the 9,362-row buffer (86,274,048 B from a
+/// 57,520,128 B source). The invariant is `rows <= capacity`, and
+/// `capacity` always equals the device buffers' row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheGeom {
+    capacity: usize,
+}
+
+impl CacheGeom {
+    fn new(capacity: usize) -> Self {
+        Self { capacity }
+    }
+
+    /// Grow so `need` rows fit; returns the new capacity when the
+    /// buffers change. The caller then allocates them and copies the
+    /// live rows, which are `<= capacity` at this point.
+    fn grow(&mut self, need: usize) -> Option<usize> {
+        if need <= self.capacity {
+            return None;
+        }
+        let new_cap = need.max(self.capacity * 2).max(1);
+        self.capacity = new_cap;
+        Some(new_cap)
+    }
+
+    /// A compaction rebuilt the buffers at exactly `out_rows` rows.
+    fn compact(&mut self, out_rows: usize) {
+        self.capacity = out_rows;
+    }
+}
+
 /// One layer's KV cache: K/V on the device as `[rows, heads·d]`, temporal
 /// indices and slot kinds on the host.
 pub struct GKvCache {
     heads: usize,
     head_dim: usize,
-    capacity: usize,
+    geom: CacheGeom,
     k: GBuf,
     v: GBuf,
     temporal: Vec<usize>,
@@ -625,14 +661,22 @@ impl WgpuBackend {
 
     /// Grow a cache's device buffers so `need` rows fit.
     fn cache_grow(&self, cache: &mut GKvCache, need: usize) {
-        if need <= cache.capacity {
+        let old_cap = cache.geom.capacity;
+        let Some(new_cap) = cache.geom.grow(need) else {
             return;
-        }
-        let new_cap = need.max(cache.capacity * 2).max(1);
+        };
         let width = cache.width();
         let nk = self.alloc(new_cap * width);
         let nv = self.alloc(new_cap * width);
         let len = cache.rows();
+        // The copy reads the OLD buffers, which hold old_cap rows: the
+        // live rows must fit them. The 2026-11-13 Vast.ai panic copied
+        // 14,042 rows from a 9,362-row buffer because a compaction had
+        // shrunk the buffers without updating the capacity.
+        debug_assert!(
+            len <= old_cap,
+            "cache_grow copies {len} rows from a {old_cap}-row buffer"
+        );
         if len > 0 {
             let bytes = len * width;
             self.copy(&cache.k, 0, &nk, 0, bytes);
@@ -640,7 +684,6 @@ impl WgpuBackend {
         }
         cache.k = nk;
         cache.v = nv;
-        cache.capacity = new_cap;
     }
 
     /// Write `rows` K/V rows (`[heads, rows, head_dim]`) into the cache at
@@ -708,6 +751,10 @@ impl WgpuBackend {
         );
         cache.k = nk;
         cache.v = nv;
+        // The buffers are now exactly out_rows rows: the capacity must
+        // follow them, or a later grow skips the allocation it owes and
+        // a copy reads past the old buffers (the 2026-11-13 panic).
+        cache.geom.compact(out_rows);
     }
 }
 
@@ -1196,7 +1243,7 @@ impl Backend for WgpuBackend {
         GKvCache {
             heads,
             head_dim,
-            capacity: capacity_tokens,
+            geom: CacheGeom::new(capacity_tokens),
             k: self.alloc(capacity_tokens * width),
             v: self.alloc(capacity_tokens * width),
             temporal: Vec::with_capacity(capacity_tokens),
@@ -1295,18 +1342,22 @@ impl Backend for WgpuBackend {
         };
         // Seed the EMA slots, if missing, right after the sinks — with the
         // same order as the CPU: splicing ShortEma then LongEma at the same
-        // position leaves [LongEma, ShortEma].
+        // position leaves [LongEma, ShortEma]. Each slot is a FULL frame
+        // (frame_tokens rows), like the CPU oracle: the first version
+        // spliced one row per slot, which shifted every later frame
+        // boundary by two rows and left the EMA slots one row wide while
+        // ema_fold writes a whole frame into them.
         let mut kinds = frame_kinds(cache);
         if !kinds.contains(&SlotKind::LongEma) && kinds.len() > cfg.sink_frames {
             let at = cfg.sink_frames * frame_tokens;
             let t = cache.temporal[at.min(cache.rows() - 1)];
             let mut map: Vec<u32> = (0..cache.rows() as u32).collect();
-            map.splice(at..at, [PAD, PAD]);
+            map.splice(at..at, vec![PAD; 2 * frame_tokens]);
             self.cache_compact(cache, &map);
-            cache.temporal.splice(at..at, [t, t]);
-            cache
-                .kinds
-                .splice(at..at, [SlotKind::LongEma, SlotKind::ShortEma]);
+            cache.temporal.splice(at..at, vec![t; 2 * frame_tokens]);
+            let mut ema_kinds = vec![SlotKind::LongEma; frame_tokens];
+            ema_kinds.extend(std::iter::repeat_n(SlotKind::ShortEma, frame_tokens));
+            cache.kinds.splice(at..at, ema_kinds);
             kinds = frame_kinds(cache);
         }
         // Graduate New frames beyond the new window to Recent, oldest first.
@@ -1477,5 +1528,162 @@ impl Backend for WgpuBackend {
 
     fn tanh_clamp(&self, x: &GBuf, n: usize, s: f32) {
         self.elementwise(2, x, None, None, n, [0u32; 8], [s, 0.0], [0u32; 4]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse + validate one shader (COMMON prepended, exactly like
+    /// `pipeline()` builds it) with naga — no GPU needed.
+    fn validate_shader(key: &str, body: &str) {
+        let code = format!("{COMMON}\n{body}");
+        let module = naga::front::wgsl::parse_str(&code)
+            .unwrap_or_else(|e| panic!("{key}: WGSL parse failed: {e:?}"));
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{key}: WGSL validation failed: {e:?}"));
+    }
+
+    #[test]
+    fn flash_shader_validates_for_all_bk() {
+        // The flash kernel is templated on BK (attn_bk is 8, 16 or 32 by
+        // workgroup storage); the VSA sub-chunking const SUB = 64 / BK
+        // must const-evaluate for every one of them.
+        for bk in [8usize, 16, 32] {
+            let body = FLASH
+                .replace("{BK_D}", &(bk * 128).to_string())
+                .replace("{BK}", &bk.to_string());
+            validate_shader(&format!("flash_bk{bk}"), &body);
+        }
+    }
+
+    #[test]
+    fn static_shaders_validate() {
+        for (key, body) in [
+            ("vsa_pool", VSA_POOL),
+            ("vsa_coarse", VSA_COARSE),
+            ("kv_compact", KV_COMPACT),
+            ("elementwise", ELEM),
+            ("head_split", HEADS),
+            ("norm", NORM),
+        ] {
+            validate_shader(key, body);
+        }
+        // The templated GEMM/conv shaders, both weight storages.
+        for f16 in [false, true] {
+            validate_shader(
+                &format!("linear_f16_{f16}"),
+                &WgpuBackend::weight_src(LINEAR, f16),
+            );
+            validate_shader(
+                &format!("conv_f16_{f16}"),
+                &WgpuBackend::weight_src(CONV, f16),
+            );
+        }
+    }
+
+    #[test]
+    fn kv_cache_geom_never_copies_past_the_buffer_at_real_scale() {
+        // Real 832x480 shapes: 1560 tokens per latent frame, 3-frame
+        // chunks, a 12-frame MemRoPE budget (3 sink + 1 long + 1 short +
+        // 4 recent + 3 new). Replays the 81-frame generate (7 chunks x 4
+        // DMD steps) with the CPU backend as the oracle for the row
+        // trajectory -- the oracle's `temporal`/`kinds` decide when the
+        // wgpu cache would seed and evict -- and drives the production
+        // capacity transitions (CacheGeom::grow / CacheGeom::compact)
+        // alongside it, asserting the copy invariant: live rows never
+        // exceed the rows the device buffers hold, at every grow.
+        //
+        // The 2026-11-13 Vast.ai panic was this invariant failing: the
+        // EMA seed compacted the buffers to 9,362 rows while the capacity
+        // still said 18,720, so chunk 3's append skipped its grow and
+        // chunk 4's grow copied 14,042 rows from the 9,362-row buffer
+        // (86,274,048 B from a 57,520,128 B source). With the pre-fix
+        // rules the replay reaches rows 14,042 with a 9,362-row buffer
+        // at chunk 2's append and the assertion below fails.
+        //
+        // Scope: this pins the capacity bookkeeping and the row
+        // trajectory against the oracle. The seed-count fix itself
+        // (full frames, not 2 rows) is verified on GPU by the tiny-DiT
+        // rollout test, which compares the whole DiT output against the
+        // CPU oracle -- any cache misalignment moves the latent past 1e-5.
+        use lightx2v_cpu::CpuBackend;
+        let be = CpuBackend;
+        let cfg = MemRopeConfig::default_memrope();
+        let frame_tokens = 1560usize;
+        let (heads, head_dim) = (12usize, 128usize);
+        let chunk_rows = cfg.new_frames() * frame_tokens;
+        let mut cache = be.kv_cache_new(heads, head_dim, cfg.cache_frames * frame_tokens);
+        let mut geom = CacheGeom::new(cfg.cache_frames * frame_tokens);
+        // Actual device buffer rows, tracked independently of the
+        // capacity the code believes: the two must agree after every op.
+        let mut buffer_rows = cfg.cache_frames * frame_tokens;
+        // Dummy chunk K/V (values don't matter: the update only reads
+        // temporal/kinds). One allocation reused for every put.
+        let zeros = vec![0.0f32; heads * chunk_rows * head_dim];
+        let kb = be.upload(&zeros);
+        let vb = be.upload(&zeros);
+        let mut seeded_rows: Option<usize> = None;
+        for chunk in 0..7 {
+            let start_frame = chunk * cfg.new_frames();
+            let temporal: Vec<usize> = (0..chunk_rows)
+                .map(|i| start_frame + i / frame_tokens)
+                .collect();
+            for step in 0..4 {
+                let rows_before = be.kv_cache_len(&cache);
+                if step == 0 {
+                    // First DMD step of a chunk appends; re-runs overwrite.
+                    let old_cap = geom.capacity;
+                    let need = rows_before + chunk_rows;
+                    if let Some(new_cap) = geom.grow(need) {
+                        // The grow copies the live rows from the old
+                        // buffers: they must fit the old capacity.
+                        assert!(
+                            rows_before <= old_cap,
+                            "grow copies {rows_before} rows from a {old_cap}-row buffer"
+                        );
+                        buffer_rows = new_cap;
+                    }
+                }
+                be.kv_cache_put(&mut cache, &kb, &vb, chunk_rows, &temporal);
+                // The update may compact (seed once, evictions while over
+                // budget): detect it from the oracle state before the call.
+                let frames_before = be.kv_cache_len(&cache) / frame_tokens;
+                let will_seed =
+                    !cache.kinds.contains(&SlotKind::LongEma) && frames_before > cfg.sink_frames;
+                let frames_after_seed = frames_before + if will_seed { 2 } else { 0 };
+                let compacted = will_seed || frames_after_seed > cfg.cache_frames;
+                be.kv_cache_memrope_update(&mut cache, &cfg, frame_tokens);
+                let rows_after = be.kv_cache_len(&cache);
+                if compacted {
+                    buffer_rows = rows_after;
+                    geom.compact(rows_after);
+                }
+                if will_seed && seeded_rows.is_none() {
+                    seeded_rows = Some(rows_after);
+                }
+                assert_eq!(
+                    buffer_rows,
+                    geom.capacity,
+                    "capacity {capacity} disagrees with the {buffer_rows}-row buffers",
+                    capacity = geom.capacity
+                );
+                assert!(
+                    rows_after <= buffer_rows,
+                    "live rows {rows_after} exceed the {buffer_rows}-row buffers"
+                );
+            }
+        }
+        // Chunk 1's seed must hold two full EMA frames (12,480 rows),
+        // not the buggy 9,362, and the cache ends at exactly the
+        // 12-frame budget.
+        assert_eq!(seeded_rows, Some(12_480));
+        assert_eq!(be.kv_cache_len(&cache), cfg.cache_frames * frame_tokens);
     }
 }

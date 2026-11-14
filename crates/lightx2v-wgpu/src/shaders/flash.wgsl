@@ -29,6 +29,12 @@ struct P { heads: u32, sq: u32, sk: u32, d: u32, scale: f32, mode: u32, nb: u32,
 const BK: u32 = {BK}u;
 const DMAX: u32 = 128u;
 const PAD: u32 = 0xffffffffu;
+// A VSA tile holds 64 tokens but one fine-stage chunk covers BK keys, so
+// a selected tile needs 64/BK sub-chunks (BK in {8, 16, 32} divides 64).
+// The first version used one chunk per selected tile and silently
+// dropped tile slots BK..63 — at BK=32 half of every selected tile
+// went unattended (check sparse==dense failed at 7.001e-1 on the GPU).
+const SUB: u32 = 64u / BK;
 var<workgroup> ks: array<f32, {BK_D}>;
 var<workgroup> vs: array<f32, {BK_D}>;
 
@@ -55,15 +61,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     var l = 0.0;
     var s: array<f32, {BK}>;
     var nchunks = (p.sk + BK - 1u) / BK;
-    if (p.mode == 1u) { nchunks = p.topk; }
+    if (p.mode == 1u) { nchunks = p.topk * SUB; }
     for (var c = 0u; c < nchunks; c = c + 1u) {
         // Key tokens of this chunk (PAD = padding slot / out of range).
         var krows: array<u32, {BK}>;
         for (var jj = 0u; jj < BK; jj = jj + 1u) {
             var tok = PAD;
             if (p.mode == 1u) {
-                let tile = sel[(h * p.nb + qt) * p.topk + c];
-                tok = slot[tile * 64u + jj];
+                // Sub-chunk c of selected tile c / SUB, slots (c % SUB) * BK..
+                let tile = sel[(h * p.nb + qt) * p.topk + c / SUB];
+                tok = slot[tile * 64u + (c % SUB) * BK + jj];
             } else {
                 let r = c * BK + jj;
                 if (r < p.sk) { tok = r; }
